@@ -1,6 +1,6 @@
 {
-  "base": "18.6.0",
+  "base": "18.7.0",
   "bump": "minor",
   "channel": "production",
-  "notes": "V18.7 separates entry analysis from local position management, parses currency and amount type, and preserves user-reported realized P&L on closure."
+  "notes": "V18.8: deeper held-position risk analysis, transparent P&L components, two-sided price scenarios and safe Telegram message splitting."
 }
