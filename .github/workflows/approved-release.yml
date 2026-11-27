@@ -1,0 +1,46 @@
+name: Approved release
+on:
+  push:
+    branches: [main, 'work/release-automation']
+    paths: ['release-plan.json', '.github/workflows/approved-release.yml', 'ci/**']
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.ref == 'refs/heads/main' && 'signed-release' || github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: python -m pip install 'cryptography>=44,<52'
+      - run: python ci/check_release.py
+      - run: python ci/test_update.py
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: python -m pip install 'cryptography>=44,<52'
+      - name: Sign, verify and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PRIVATE_KEY_B64: ${{ secrets.COIN_RELEASE_SIGNING_KEY }}
+        run: |
+          if git diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- release-plan.json; then
+            echo 'No release plan change.'
+          else
+            python ci/check_release.py --publish
+          fi
