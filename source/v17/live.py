@@ -33,12 +33,12 @@ API_LOCK=threading.Lock()
 API_COOLDOWN={}
 LOG=logging.getLogger('v18')
 
-def api(host,path,**q):
+def api(host,path,*,timeout=12,**q):
     with API_LOCK:
         if time.monotonic()<API_COOLDOWN.get(host,0):
             raise OSError(f'{path}: HTTP rate-limit cooldown')
     try:
-        with urlopen(host+path+'?'+urlencode(q),timeout=12) as f:
+        with urlopen(host+path+'?'+urlencode(q),timeout=timeout) as f:
             result=json.load(f)
     except HTTPError as exc:
         if exc.code in (418,429):

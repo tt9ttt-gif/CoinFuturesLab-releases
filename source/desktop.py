@@ -65,7 +65,7 @@ def put(key,value):
 
 def tg(token,method,params):
     req=Request('https://api.telegram.org/bot'+token+'/'+method,data=json.dumps(params).encode(),headers={'Content-Type':'application/json'})
-    with urlopen(req,timeout=38) as r:
+    with urlopen(req,timeout=25 if method=='getUpdates' else 8) as r:
         x=json.load(r)
     if not x.get('ok'): raise RuntimeError('Telegram rejected request')
     return x['result']
@@ -104,6 +104,8 @@ def notify(key,signature,text,detected=None,cooldown=0,force=False):
     now=time.time()
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
+        actual=re.match(r'user/(\d+)/',key)
+        if actual and not any(p['id']==int(actual[1]) for p in kv_get(c,'positions',[])): return
         row=c.execute('SELECT signature,queued FROM alerts WHERE key=?',(key,)).fetchone()
         if row and (row[0]==signature or (not force and now-row[1]<cooldown)):
             return
@@ -201,7 +203,8 @@ def margin_choices(plan,seed,positions,funding=None,requested_leverage=None):
     """Existing standard caps, with an additional funding and exposure reserve."""
     risk=0.; reserved=0.
     for held in positions:
-        margin=held['margin']; lev=held['leverage']; entry=held['entry']
+        margin=held.get('margin'); lev=held.get('leverage'); entry=held['entry']
+        if margin is None or lev is None: return None,[]
         reserved+=margin
         stop=held.get('stop')
         distance=max(0.,held['side']*(entry-stop)/entry) if stop is not None else 1/lev
@@ -241,6 +244,174 @@ def signal_context(m,c):
     return ((aligned or neutral or structural) and len(evidence)>=2) or correlated_setup,evidence
 
 
+def trade_intent(message):
+    low=message.strip().lower()
+    if re.search(r'예약|지정가.*(?:걸|어때|어떨)',low):
+        return 'reservation'
+    if low.startswith('/register') or '진입했' in low:
+        return 'register'
+    if len(requested_symbols(low))==1 and not re.search(r'[?？]|어때|분석|하면|하려|괜찮|들어가|해도|어떨',low):
+        if re.search(r'진입가\s*[\d,.]+|(?:롱|숏)\s*[\d,.]+',low):
+            return 'register'
+    return None
+
+
+def trade_fields(message):
+    fields=parse(message,{})
+    if 'entry' not in fields:
+        cleaned=re.sub(r'(?:익절가|손절가|증거금)\s*[\d,.]+\s*(?:만\s*원|원)?|[\d,.]+\s*배','',message)
+        match=re.search(r'[\d][\d,.]*',cleaned)
+        if match:
+            fields['entry']=float(match[0].replace(',','').rstrip('.'))
+    return fields
+
+
+def position_review(p,m,seed):
+    side=p['side']
+    price=m.get('mark_price') or m['price']
+    c=next(x for x in m['directions'] if x['side']==side)
+    structure=m.get('structure_break')==-side
+    opposite=m.get('market_direction')==('하락' if side==1 else '상승')
+    adverse=m['candidate']['side']!=side and m['candidate']['score']>=1.65
+    stop=p.get('stop')
+    hit=stop is not None and side*(price-stop)<=0
+    near=stop is not None and side*(price-stop)/price<=max(.002,c['atr_ratio'])
+    lev,margin=p.get('leverage'),p.get('margin')
+    pnl=margin*lev*(side*(price/p['entry']-1)-live.FEE*(1+price/p['entry'])) if lev and margin else None
+    liq=p['entry']*(1-side*(1/lev-live.FEE))/(1-side*.005) if lev else None
+    liquidation=liq is not None and side*(price-liq)/price<.005
+    proposal=position_adjustment(p,m,c) if adverse and (structure or opposite) else None
+    state=('스탑 도달' if hit else '청산 근접' if liquidation else '추세·구조 동시 역행' if structure and opposite
+           else '스탑 접근' if near else '구조·반대 근거 강화' if structure and adverse else '조정 검토' if proposal else '유지')
+    action=('전체 청산 검토' if state in ('스탑 도달','청산 근접','추세·구조 동시 역행')
+            else '손절 조정 검토' if proposal and proposal[0]!=stop else '일부 청산 검토' if state!='유지' else '유지')
+    lines=[f"📌 등록 #{p['id']} {p['symbol']} · {action}",
+           f"⚠️ {state} · 상위 방향 {m.get('market_direction','불확실')} · 구조 {'역행' if structure else '이탈 미확인'}",
+           f"현재 {fmt(price)} / 등록가 {fmt(p['entry'])} · {'롱' if side==1 else '숏'}",
+           f"지지 {fmt(m.get('support'))} / 저항 {fmt(m.get('resistance'))} · 손절 {fmt(stop)}",
+           f"레버리지 {fmt(lev,0)} / 증거금 {fmt(margin,0)}원 · 모형 청산가 {fmt(liq)}",
+           f"펀딩 제외 추정 손익 {fmt(pnl,0)}원"+(f" · 시드 대비 {pnl/seed:+.2%}" if pnl is not None else ''),
+           '등록값 기준 추정 · 거래소 체결 미확인']
+    if stop is not None and lev and margin:
+        risk=margin*lev*(max(0.,side*(p['entry']-stop)/p['entry'])+2*live.FEE+live.SLIP+abs(m.get('funding') or 0.))
+        lines.append(f"손절 계획 위험 {risk:,.0f}원 · 시드 대비 {risk/seed:.2%}")
+    if proposal:
+        for name,label,new in zip(('stop','target'),('손절','익절'),proposal):
+            old=p.get(name)
+            if old is not None and new!=old:
+                delta=side*(new-old)/p['entry']*lev*margin if lev and margin else None
+                lines.append(f"{label} 조정 검토 {fmt(old)} → {fmt(new)} · 가격 기준 손익 변화 {fmt(delta,0)}원")
+    return state,'\n'.join(lines)
+
+
+def mutate_registration(fields,mode,ident=None):
+    with db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        active=kv_get(conn,'positions',[])
+        existing=[p for p in active if p['symbol']==fields['symbol']]
+        if existing and mode is None:
+            return None,existing
+        old=next((p for p in existing if p['id']==ident),None)
+        if mode=='edit' and old is None:
+            return None,existing
+        used={p['id'] for p in active}
+        history=kv_get(conn,'position_history',[])
+        used.update(e.get('after',{}).get('id') for e in history if isinstance(e.get('after'),dict))
+        new_id=ident if mode=='edit' else max(used|{99999},key=lambda n:n or 0)+1
+        previous_fields={k:v for k,v in (old or {}).items() if k not in fields and (old['side']==fields['side'] or k not in ('stop','target'))}
+        p=dict(previous_fields,**fields,id=new_id)
+        if not all(p.get(k) is None or math.isfinite(p[k]) and p[k]>0 for k in ('entry','leverage','margin','target','stop')):
+            raise ValueError('invalid numeric field')
+        if p.get('leverage') is not None and not 1<=p['leverage']<=125:
+            raise ValueError('invalid leverage')
+        if old:
+            active[active.index(old)]=p
+        else:
+            active.append(p)
+        history.append(dict(at=time.time(),operation=mode or 'register',before=old,after=p))
+        kv_put(conn,'positions',active)
+        kv_put(conn,'position_history',history)
+        return p,[]
+
+
+def kv_get(conn,key,default):
+    row=conn.execute('SELECT value FROM kv WHERE key=?',(key,)).fetchone()
+    return json.loads(row[0]) if row else default
+
+
+def kv_put(conn,key,value):
+    conn.execute('INSERT OR REPLACE INTO kv VALUES (?,?)',(key,json.dumps(value,ensure_ascii=False)))
+
+
+def trade_command(message,identity,prior,positions,seed):
+    low=message.strip().lower()
+    key='pending-trade/'+identity
+    pending=get(key,{})
+    if time.time()-pending.get('at',0)>600:
+        pending={}
+    if low in ('취소','/pos cancel'):
+        put(key,{})
+        return '입력 확인을 취소했습니다.'
+    close=re.fullmatch(r'(?:(.*?)\s*)?거래\s*종료',low)
+    if close:
+        syms=requested_symbols(low)
+        matches=[p for p in positions if not close[1] or p['symbol'] in syms]
+        if len(matches)==1:
+            return position_edit(['/pos','close',str(matches[0]['id'])])
+        return ('종료할 포지션을 선택하세요. /pos close 번호\n'+
+                ', '.join(f"#{p['id']} {p['symbol']}" for p in matches)) if matches else '종료할 등록 포지션이 없습니다.'
+    intent=trade_intent(message)
+    mode=None
+    ident=None
+    if intent:
+        fields=trade_fields(message)
+    elif pending and low in ('롱','숏','long','short','확인'):
+        intent=pending['intent']
+        fields=pending['fields']
+        side=pending.get('side') if low=='확인' else 1 if low in ('롱','long') else -1
+        if side not in (-1,1): return '롱 또는 숏을 입력하세요.'
+        fields['side']=side
+    elif pending.get('collision') and re.fullmatch(r'추가|수정\s*\d+',low):
+        intent='register'
+        fields=pending['fields']
+        mode='add' if low=='추가' else 'edit'
+        if mode=='edit': ident=int(low.split()[1])
+    else:
+        return None
+    if 'symbol' not in fields and prior.get('symbol') in live.SYMS and not requested_symbols(message):
+        fields['symbol']=prior['symbol']
+    if fields.get('symbol') not in live.SYMS or not fields.get('entry') or not math.isfinite(fields['entry']):
+        return '종목 하나와 양의 USDT 가격을 입력하세요.'
+    if 'side' not in fields:
+        prior_side=prior.get('side') if prior.get('symbol')==fields['symbol'] else None
+        if intent=='reservation' and prior_side in (-1,1):
+            fields['side']=prior_side
+        else:
+            put(key,dict(intent=intent,fields=fields,side=prior_side,at=time.time()))
+            if prior_side in (-1,1):
+                return f"이전 대화 방향은 {'롱' if prior_side==1 else '숏'}입니다. 확인, 롱 또는 숏을 입력하세요."
+            return '롱인가요, 숏인가요? 롱 또는 숏을 입력하세요.'
+    if intent=='reservation':
+        put(key,{})
+        put('context/'+identity,fields)
+        m,stamp=manual_market(fields['symbol'])
+        return reservation_review(m,fields,seed,stamp) if m else '최신 완료 봉을 확보하지 못해 예약 분석을 보류합니다.'
+    p,existing=mutate_registration(fields,mode,ident)
+    if not p:
+        put(key,dict(intent=intent,fields=fields,collision=True,at=time.time()))
+        return ('기존 등록 포지션: '+', '.join(f"#{x['id']}" for x in existing)+
+                '. 기존 배수·증거금·가격을 유지하며 수정하려면 수정 번호, 독립 기록으로 추가하려면 추가를 입력하세요.')
+    put(key,{})
+    put('context/'+identity,{'symbol':p['symbol'],'side':p['side']})
+    missing=' · '.join(label for k,label in [('leverage','배수'),('margin','증거금'),('target','익절가'),('stop','손절가')] if p.get(k) is None)
+    reply=f"#{p['id']} 사용자 포지션 등록 완료"+(f" · 미입력 {missing}" if missing else '')
+    try:
+        m,_=manual_market(p['symbol'])
+        return reply+'\n\n'+(position_review(p,m,seed)[1] if m else '최신 데이터 부족으로 초기 대응 판단을 보류합니다.')
+    except (OSError,ValueError,TimeoutError):
+        return reply+'\n최신 데이터 조회에 실패했습니다. 등록 기록은 저장했습니다.'
+
+
 def position_edit(parts):
     with db() as conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -255,13 +426,20 @@ def position_edit(parts):
         if parts[1]=='add' and len(parts)==5:
             price,margin=map(float,parts[3:])
             if not all(math.isfinite(x) and x>0 for x in (price,margin)): return '가격·증거금은 양수여야 합니다.'
+            if not p.get('margin'): return '기존 증거금이 없어 평균 진입가를 계산할 수 없습니다.'
             p['entry']=(p['margin']+margin)/(p['margin']/p['entry']+margin/price)
             p['margin']+=margin
+        elif parts[1]=='levels' and len(parts)==4:
+            levels={k:v for k,v in parse(parts[3],{}).items() if k in ('target','stop')}
+            if not levels or not all(math.isfinite(v) and v>0 for v in levels.values()): return '양의 익절가 또는 손절가를 입력하세요.'
+            p.update(levels)
         elif parts[1] in ('reduce','close'):
             fraction=1. if parts[1]=='close' else float(parts[3])/100 if len(parts)==4 else 0.
             if not 0<fraction<=1: return '청산 비율은 0 초과 100 이하입니다.'
-            p['margin']*=1-fraction
-            if fraction==1: active.remove(p)
+            if p.get('margin') is not None: p['margin']*=1-fraction
+            if fraction==1:
+                active.remove(p)
+                conn.execute("UPDATE outbox SET suppressed=1 WHERE sent IS NULL AND instr(body,?)>0",(f'등록 #{ident} ',))
         else: return '/pos add 번호 가격 증거금원 · /pos reduce 번호 비율 · /pos close 번호'
         history.append(dict(at=time.time(),operation=parts[1],before=previous,after=dict(p)))
         conn.executemany('INSERT OR REPLACE INTO kv VALUES (?,?)',
@@ -325,9 +503,15 @@ def review(m,context,seed,stamp=None,event=None):
     manual='manual_indicators' in m and event is None
     supporting=[]; opposing=[]
     if manual: status,supporting,opposing=manual_assessment(m,c)
+    if context.get('reservation'):
+        status='watch' if context['reservation']=='비추천' else 'conditional'
+        c=dict(c,trigger=context['reservation_trigger'],invalidation=context['reservation_invalidation'])
     title=('조건부 진입 후보' if status=='conditional' else '즉시 검토 후보' if status=='entry' else '관찰 후보')
     icon='🟢' if side==1 else '🔴'
-    rows=[RULE,f'{icon} {sym} {label} {title}']
+    rows=[RULE,f'{icon} {sym} {label} {title}',
+          '판단 · '+('진입 검토' if status=='entry' else '조건 확인 후 대기' if status=='conditional' else '관망'),
+          '핵심 · '+(' / '.join(reason(a,m) for a,_ in c['reasons'][:2]) or '뚜렷한 근거 없음'),
+          '위험 · '+c['invalidation']]
     if event: rows.append(f'• {event}')
     if stamp: rows.append('📅 '+timestamp(stamp)+' · 완료 봉')
     rows.extend([f"📊 {c['grade']} | 신뢰도 {c['confidence']}",f"현재가 {fmt(m['price'])} USDT · 상위 방향 {m.get('market_direction','불확실')}",'',RULE,
@@ -410,13 +594,77 @@ def review(m,context,seed,stamp=None,event=None):
 
 HELP='/btc /eth /long eth /short btc /market /positions /paper /seed [원] /status /alerts [important|all|off|on|status] /alerts paper on|off /alerts summary on|off /format simple|normal|detailed /version /update check /help\n예: ETH 30배 롱 / 그럼 숏은? / 진입가 1730 / 증거금 20만 원\n등록: ETH 숏 진입했어. 진입가 1730, 30배, 증거금 20만 원.\n삭제: /close 번호 · 수동 모의 요청: /simulate eth short / 기존 등록에 TP/SL 지정: /levels 번호 익절가 1700 손절가 1750'
 
+def reservation_review(m,fields,seed,stamp):
+    entry,side=fields['entry'],fields['side']
+    current=m['price']
+    c=next(x for x in m['directions'] if x['side']==side)
+    support,resistance=m['support'],m['resistance']
+    atr=max(.001,c['atr_ratio'])
+    level=support if side==1 else resistance
+    offset=entry/current-1
+    marketable=side*offset>=0
+    near=abs(entry/level-1)<=max(.002,atr)
+    opposing=m.get('market_direction')==('하락' if side==1 else '상승')
+    status='비추천' if marketable or (opposing and not near) else '조건부 가능' if not c['confirmed'] or opposing or not near else '예약 적절'
+    stop=fields.get('stop',entry-side*max(entry*atr,abs(entry-level)+entry*atr*.25) if near else entry*(1-side*atr*1.5))
+    opposite_level=resistance if side==1 else support
+    target=fields.get('target',opposite_level if side*(opposite_level-entry)>entry*atr else entry*(1+side*atr*2))
+    if side*(entry-stop)<=0 or side*(target-entry)<=0 or min(stop,target)<=0:
+        status='비추천'
+    trigger=('현재가 기준 주문이 즉시 체결될 수 있어 대기 가격을 재검토하세요.' if marketable else
+             '예약가 부근에서 '+('지지 회복 및 매수 우세' if side==1 else '저항 유지 및 매도 우세')+
+             '를 확인하세요. 가격 도달만으로 체결을 확인할 수 없습니다.')
+    invalidation=f"{fmt(stop)} {'하향' if side==1 else '상향'} 이탈 또는 상위 구조·수급의 반대 방향 전환"
+    plan=dict(fields,stop=stop,target=target,reservation=status,
+              reservation_trigger=trigger,reservation_invalidation=invalidation)
+    return '\n'.join([
+        f"📌 {m['symbol']} {'롱' if side==1 else '숏'} 예약 판단 · {status}",
+        f"현재 {fmt(current)} → 예약 {fmt(entry)} USDT ({offset:+.2%})",
+        f"지지 {fmt(support)} / 저항 {fmt(resistance)} · {'인접 구조 있음' if near else '인접 구조 미확인'}",
+        '예약 조건 · '+trigger,
+        '취소 기준 · '+invalidation,
+        review(m,plan,seed,stamp),
+    ])
+
+
+def manual_report(symbols):
+    timing=getattr(REPLY_TIMING,'value',None)
+    data_spans=[]
+    def fetch(host,path,**params):
+        start=time.monotonic()
+        try:
+            return monitor_api(host,path,fetch_rest=manual_rest,**params)
+        finally:
+            data_spans.append((start,time.monotonic()))
+    start=time.monotonic()
+    try:
+        return live.tick(read_only=True,market_api=fetch,symbols=symbols)
+    finally:
+        if timing is not None and data_spans:
+            data=max(end for _,end in data_spans)-start
+            timing['market_data_s']=round(data,3)
+            timing['market_compute_s']=round(max(0.,time.monotonic()-start-data),3)
+
+
+def manual_market(symbol):
+    report=manual_report((symbol,))
+    stamp=report['completed_through_utc']
+    if abs(time.time()-datetime.fromisoformat(stamp).timestamp())>150:
+        return None,stamp
+    return next((m for m in report['market'] if m['symbol']==symbol),None),stamp
+
+
+REPLY_TIMING=threading.local()
+
+
 def latest():
     return json.loads(LIVE.read_text(encoding='utf-8')) if LIVE.exists() else {}
 
 def handle(message,identity='cmd'):
     low=message.strip().lower()
     if low in ('/version','/update') or low.startswith('/update '): return autoupdate.command(low)
-    context=parse(message,get('context/'+identity,{}))
+    prior=get('context/'+identity,{})
+    context=parse(message,prior)
     seed=get('seed',3_000_000)
     if low.startswith('/seed'):
         fields=low.replace(',','').split()
@@ -434,7 +682,7 @@ def handle(message,identity='cmd'):
             put('format',args[1])
             return '메시지 상세도: '+args[1]
         return '/format simple | /format normal | /format detailed'
-    if low=='/help': return HELP+'\n/pos add 번호 가격 증거금원 · /pos reduce 번호 비율 · /pos close 번호'
+    if low=='/help': return HELP+'\n등록: 이더 숏 진입가 1750 · 거래종료: 이더 거래종료 /pos close 번호 · 예약 분석: 이더 1700 롱 예약 · 상태: /pos'+'\n/pos add 번호 가격 증거금원 · /pos reduce 번호 비율 · /pos close 번호'
     if low=='/status': return json.dumps(get('status',{}),ensure_ascii=False)
     if low=='/paper':
         accounts=latest().get('paper',{}).get('accounts',{})
@@ -444,17 +692,16 @@ def handle(message,identity='cmd'):
             for name,a in accounts.items())
 
     positions=get('positions',[])
+    special=trade_command(message,identity,prior,positions,seed)
+    if special is not None: return special
     if low.startswith('/pos ') and len(low.split())>=3: return position_edit(low.split())
     if low.startswith('/close '): return position_edit(['/pos','close',low.split()[1]])
     if low.startswith('/levels '):
-        ident=int(low.split()[1])
-        found=next((p for p in positions if p['id']==ident),None)
-        if not found: return '등록 번호를 확인하세요.'
-        found.update({k:v for k,v in parse(low,{}).items() if k in ('target','stop')})
-        put('positions',positions);return '등록 포지션 감시 가격을 갱신했습니다.'
-    position_query=low=='/positions' or '보유 중' in low or '가지고 있어' in low
+        return position_edit(['/pos','levels',low.split()[1],low])
+    position_query=low in ('/pos','/positions') or '보유 중' in low or '가지고 있어' in low
     symbols=tuple(dict.fromkeys(p['symbol'] for p in positions)) if position_query else query_symbols(message,context)
-    report=live.tick(read_only=True,market_api=ORIGINAL_API,symbols=symbols)
+    if position_query and not symbols: return '등록 포지션이 없습니다.'
+    report=manual_report(symbols)
     end=datetime.fromisoformat(report['completed_through_utc'])
     if abs((datetime.now(timezone.utc)-end).total_seconds())>150:
         return '최신 완료 봉 시각을 검증하지 못해 분석을 보류합니다.'
@@ -464,20 +711,8 @@ def handle(message,identity='cmd'):
         for p in positions:
             m=markets.get(p['symbol'])
             if not m: continue
-            price=m.get('mark_price') or m['price']
-            pnl=p['margin']*p['leverage']*(p['side']*(price/p['entry']-1)-live.FEE*(1+price/p['entry']))
-            rows.append(f"#{p['id']} 펀딩 제외 추정 {fmt(pnl,0)}원\n"+review(m,p,seed,report['completed_through_utc']))
+            rows.append(position_review(p,m,seed)[1])
         return '\n\n'.join(rows) or '등록 포지션이 없거나 최신 데이터가 비었습니다.'
-    if '진입했' in low or low.startswith('/register'):
-        if any(k not in context for k in ('symbol','side','entry','leverage','margin')): return '종목·방향·진입가·배수·증거금을 입력하세요.'
-        if min(context['entry'],context['margin'])<=0 or not 1<=context['leverage']<=125: return '진입가, 증거금, 배수를 확인하세요.'
-        m=markets.get(context['symbol'])
-        if m:
-            candidate=next(c for c in m['directions'] if c['side']==context['side'])
-            for key in ('target','stop'): context.setdefault(key,candidate[key])
-        position=dict(context,id=secrets.randbelow(900000)+100000)
-        put('positions',positions+[position])
-        return f"#{position['id']} 등록 완료. 거래소 체결은 확인하지 않았습니다."
     put('context/'+identity,context)
     if low.startswith('/simulate'):
         m=markets.get(context.get('symbol'))
@@ -513,21 +748,68 @@ def respond(message,identity,reply):
         LOG.warning('analysis failed: %s',type(ex).__name__)
         reply('분석 실패. 입력 형식과 데이터 연결을 확인하세요.')
 
-def receive(stop,token,chat):
+def receive(stop,token,chat,manual):
     offset=get('telegram_offset',0)
     while not stop.is_set():
+        started=time.monotonic()
         try:
             updates=tg(token,'getUpdates',dict(offset=offset,timeout=20,allowed_updates=['message']))
+            received=time.monotonic()
             for u in updates:
+                msg=u.get('message',{})
+                valid=(str(msg.get('chat',{}).get('id'))==str(chat) and msg.get('chat',{}).get('type')=='private'
+                       and time.time()-msg.get('date',0)<=180 and msg.get('text'))
+                if valid:
+                    manual.put((msg['text'],dict(update=u['update_id'],received=received,
+                                                  poll_s=round(received-started,3),
+                                                  telegram_age_s=round(time.time()-msg['date'],3))))
                 offset=u['update_id']+1
                 put('telegram_offset',offset)
-                msg=u.get('message',{})
-                if str(msg.get('chat',{}).get('id'))!=str(chat) or msg.get('chat',{}).get('type')!='private': continue
-                if time.time()-msg.get('date',0)>180 or not msg.get('text'): continue
-                respond(msg['text'],'telegram/'+str(chat),lambda text: tg(token,'sendMessage',payload(chat,text)))
         except Exception as ex:
-            LOG.warning('Telegram receive/reply failed: %s',type(ex).__name__)
-            stop.wait(8)
+            LOG.warning('Telegram receive failed: %s',type(ex).__name__)
+            stop.wait(3)
+
+
+def manual_worker(stop,chat,incoming,outgoing):
+    while not stop.is_set():
+        try: message,metrics=incoming.get(timeout=.5)
+        except Empty: continue
+        started=time.monotonic()
+        metrics['queue_s']=round(started-metrics['received'],3)
+        REPLY_TIMING.value=metrics
+        def enqueue(body):
+            metrics['process_s']=round(time.monotonic()-started,3)
+            outgoing.put((body,metrics,time.monotonic()))
+        try:
+            respond(message,'telegram/'+str(chat),enqueue)
+        finally:
+            REPLY_TIMING.value=None
+
+
+def manual_sender(stop,token,chat,outgoing):
+    while not stop.is_set():
+        try: body,metrics,queued=outgoing.get(timeout=.5)
+        except Empty: continue
+        started=time.monotonic()
+        metrics['send_queue_s']=round(started-queued,3)
+        try:
+            try:
+                tg(token,'sendMessage',payload(chat,body))
+            except HTTPError as ex:
+                if ex.code!=429: raise
+                try: delay=max(1,int(ex.headers.get('Retry-After',1)))
+                except ValueError: delay=1
+                if delay>5 or stop.wait(delay): raise
+                tg(token,'sendMessage',payload(chat,body))
+            metrics['delivered']=True
+        except Exception as ex:
+            metrics['delivered']=False
+            LOG.warning('Telegram manual send failed: %s',type(ex).__name__)
+        finally:
+            metrics['send_s']=round(time.monotonic()-started,3)
+            metrics['total_s']=round(time.monotonic()-metrics.pop('received'),3)
+            LOG.info('telegram_manual %s',json.dumps(metrics,sort_keys=True))
+
 
 def backup():
     src=live.OUT/'paper.sqlite3'
@@ -555,19 +837,15 @@ def publish(report,detected):
         put(market_key,values)
         for p in get('positions',[]):
             if p['symbol']!=m['symbol']: continue
-            c=next(x for x in m['directions'] if x['side']==p['side'])
-            adverse=m['candidate']['side']!=p['side'] and m['candidate']['score']>=1.65
+            state,body=position_review(p,m,get('seed',3_000_000))
             key=f"user/{p['id']}/thesis"
-            if adverse:
-                notify(key,'opposing',f"등록 #{p['id']} 반대 방향 근거 강화 · 보유 위험 재확인",detected)
-                proposal=position_adjustment(p,m,c)
-                if proposal:
-                    stop,target=proposal
-                    size=p['margin']*p['leverage']/p['entry']
-                    delta=lambda new,old: f'{p["side"]*(new-old)*size:+,.0f}원' if new is not None and old is not None else '자료 없음'
-                    oldstop=p.get('stop'); oldtarget=p.get('target')
-                    notify(f"user/{p['id']}/adjust",f'{stop}/{target}',
-                           f"🎯 등록 #{p['id']} 구조 조정 제안\n반대 방향 근거 강화. 실제 가격은 미변경.\n익절 {fmt(oldtarget)} → {fmt(target)} · 손익 변화 {delta(target,oldtarget)}\n손절 {fmt(oldstop)} → {fmt(stop)} · 손익 변화 {delta(stop,oldstop)}\n손절 위험 확대 없음 · 수수료·갭 제외",detected,cooldown=1800)
+            if state!='유지':
+                details=body.splitlines()
+                adjustments=[line for line in details if '조정 검토 ' in line]
+                notify(key,state,'\n'.join(line for line in details if line not in adjustments),detected,force=True)
+                if adjustments:
+                    notify(f"user/{p['id']}/adjust",'|'.join(line.split(' · ',1)[0] for line in adjustments),
+                           f"등록 #{p['id']} 가격 조정 검토 · {state}\n"+'\n'.join(adjustments),detected,cooldown=1800)
             else:
                 with db() as conn: conn.execute('DELETE FROM alerts WHERE key=?',(key,))
         direction_key='last-alert-direction/'+m['symbol']
@@ -627,9 +905,13 @@ WS_BARS={}
 WS_LOCK=threading.Lock()
 ORIGINAL_API=live.api
 
-def monitor_api(host,path,**query):
+def manual_rest(host,path,**query):
+    required=path in ('/fapi/v1/time','/fapi/v1/klines')
+    return ORIGINAL_API(host,path,timeout=10 if required else 5,**query)
+
+def monitor_api(host,path,*,fetch_rest=ORIGINAL_API,**query):
     if path!='/fapi/v1/klines' or 'startTime' in query or 'endTime' in query or query.get('interval') not in ('1m','5m','15m'):
-        return ORIGINAL_API(host,path,**query)
+        return fetch_rest(host,path,**query)
     key=(query['symbol'],query['interval'])
     interval=int(key[1][:-1])*60_000
     end=(int(time.time()*1000)//interval)*interval
@@ -638,7 +920,7 @@ def monitor_api(host,path,**query):
     rows=sorted((x for x in rows if x[0]<end),key=lambda x:x[0])[-query['limit']:]
     if len(rows)==query['limit'] and rows[-1][0]==end-interval and all(b[0]-a[0]==interval for a,b in zip(rows,rows[1:])):
         return rows
-    result=ORIGINAL_API(host,path,**query)
+    result=fetch_rest(host,path,**query)
     with WS_LOCK:
         merged={x[0]:x for x in result if x[6]<end}
         merged.update(WS_BARS.get(key,{}))
@@ -701,10 +983,11 @@ def crossing(sym,price,previous,report,at,request_queue,mark=False):
         for label,k in [('목표','target'),('스탑','stop')]:
             level=p.get(k)
             if level and (previous-level)*(price-level)<=0 and previous!=price:
-                notify(f"user/{p['id']}/{k}",str(level),f"등록 #{p['id']} {label} {fmt(level)} 접근/통과 · 거래소 체결 미확인",at)
-        lev=p['leverage']; side=p['side']
+                notify(f"user/{p['id']}/{k}",str(level),f"등록 #{p['id']} 위험 확인 · {label} {fmt(level)} 도달 · 현재 {fmt(price)} · 거래소 체결 미확인",at)
+        lev=p.get('leverage'); side=p['side']
+        if not mark or not lev: continue
         liq=p['entry']*(1-side*(1/lev-live.FEE))/(1-side*.005)
-        if mark and side*(price-liq)/price<.005:
+        if side*(price-liq)/price<.005:
             notify(f"user/{p['id']}/liq",'near',f"등록 #{p['id']} 마크 {fmt(price)} · 모형 청산 {fmt(liq)} 근접",at)
 
 async def stream(stop,requests):
@@ -806,7 +1089,12 @@ def run():
             if not stop.is_set(): stop.wait(5)
     jobs=[('update',lambda:autoupdate.watch(stop)),('market',lambda: overview(stop,requests)),('stream',lambda: asyncio.run(stream(stop,requests)))]
     if token and chat:
-        jobs.extend([('telegram receive',lambda:receive(stop,token,chat)),('telegram send',lambda:sender(stop,token,chat))])
+        manual=Queue()
+        replies=Queue()
+        jobs.extend([('telegram receive',lambda:receive(stop,token,chat,manual)),
+                     ('telegram manual',lambda:manual_worker(stop,chat,manual,replies)),
+                     ('telegram reply',lambda:manual_sender(stop,token,chat,replies)),
+                     ('telegram send',lambda:sender(stop,token,chat))])
     threads=[threading.Thread(target=supervise,args=(name,func),daemon=True) for name,func in jobs]
     for t in threads: t.start()
     def cli():
