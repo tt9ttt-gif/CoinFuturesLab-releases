@@ -71,8 +71,8 @@ class RegistrationTests(unittest.TestCase):
                 'directions':[c],'candidate':c,'market_direction':'하락'}
         status,output=app.position_review(p,market,3_000_000)
         self.assertEqual(status,'유지')
-        self.assertIn('추정 손익 자료 없음',output)
-        self.assertIn('유지',output.splitlines()[0])
+        self.assertIn('가격 미실현·청산 가정 순손익 미확인',output)
+        self.assertIn('손절가 설정·조정 우선',output.splitlines()[0])
 
     def test_polling_does_not_wait_for_analysis(self):
         from threading import Event,Thread
