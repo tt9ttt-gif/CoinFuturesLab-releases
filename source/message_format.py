@@ -5,7 +5,7 @@ from math import isfinite
 
 RULE='━━━━━━━━━━━━━━'
 KST=timezone(timedelta(hours=9))
-HEADINGS=('🟢 ','🔴 ','🎯 ','💰 ','📉 ','📈 ','⚠️ ','⏳ ','❌ ','📚 ','💬 ','📊 ','🛠 ','✅ ')
+HEADINGS=('📌 ','🟢 ','🔴 ','🎯 ','💰 ','📉 ','📈 ','⚠️ ','⏳ ','❌ ','📚 ','💬 ','📊 ','🛠 ','✅ ')
 
 def timestamp(value):
     try:
@@ -26,6 +26,35 @@ def payload(chat,body):
         lines.append(f'<b>{escaped}</b>' if line.startswith(HEADINGS) else escaped)
         used+=length
     return dict(chat_id=chat,text='\n'.join(lines),parse_mode='HTML')
+
+def payloads(chat,body):
+    """Split on line boundaries before HTML escaping, with a conservative UTF-16 budget."""
+    limit=3900
+    lines=[]; used=0
+    for line in body.split('\n'):
+        length=len(line.encode('utf-16-le'))//2+1
+        if length>limit:
+            if lines:
+                yield payload(chat,'\n'.join(lines))
+                lines=[]; used=0
+            fragment=[]; units=0
+            for char in line:
+                width=2 if ord(char)>0xffff else 1
+                if units+width>=limit:
+                    yield payload(chat,''.join(fragment))
+                    fragment=[]; units=0
+                fragment.append(char)
+                units+=width
+            lines=[''.join(fragment)]; used=units+1
+            continue
+        if lines and used+length>limit:
+            yield payload(chat,'\n'.join(lines))
+            lines=[]; used=0
+        lines.append(line)
+        used+=length
+    if lines:
+        yield payload(chat,'\n'.join(lines))
+
 
 def reason(label,m):
     f=m.get('indicators',{})
