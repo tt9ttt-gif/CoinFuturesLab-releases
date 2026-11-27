@@ -1,6 +1,6 @@
 {
-  "base": "18.4.0",
+  "base": "18.5.0",
   "bump": "minor",
   "channel": "production",
-  "notes": "V18.5: single-symbol manual requests, grouped manual context, cost-aware analog outcomes and detailed market data. Automated alerts, positions, paper logic and schema unchanged. See ci/v18.5-validation.md."
+  "notes": "V18.6: local position registration and closure, read-only limit-entry analysis, decision-first messages, and separate Telegram polling, analysis and reply workers."
 }
