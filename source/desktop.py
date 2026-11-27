@@ -161,13 +161,28 @@ def sender(stop,token,chat):
             stop.wait(max(retry,delay))
             delay=min(delay*2,120)
 
+SYMBOL_PATTERNS={
+    'BTCUSDT':r'(?<![a-z0-9])(?:btc(?:usdt)?|btcc|bitcoin|btcoin)(?![a-z0-9])|비트(?:코[인잉])?',
+    'ETHUSDT':r'(?<![a-z0-9])(?:eth(?:usdt)?|ethe|ether(?:eum)?|ethe?rum)(?![a-z0-9])|이더(?:리[움윰])?|이뎌',
+}
+
+def requested_symbols(text):
+    msg=text.strip().lower()
+    if re.search(r'^/market(?: |$)|둘\s*다|전체\s*시장|두\s*종목',msg):
+        return live.SYMS
+    return tuple(symbol for symbol,pattern in SYMBOL_PATTERNS.items() if re.search(pattern,msg))
+
+def query_symbols(text,context):
+    return requested_symbols(text) or ((context['symbol'],) if context.get('symbol') in live.SYMS else live.SYMS)
+
 def parse(text,prior):
     msg=text.lower()
     out=dict(prior)
-    targets=re.findall(r'btc(?:usdt)?|비트코인|eth(?:usdt)?|이더리움',msg)
-    if targets:
-        sym='BTCUSDT' if targets[0].startswith(('btc','비트')) else 'ETHUSDT'
-        if sym!=out.get('symbol'): out={}
+    targets=requested_symbols(msg)
+    if len(targets)==1:
+        sym=targets[0]
+        if sym!=out.get('symbol') or re.fullmatch(r'/(btc|eth)',msg):
+            out={}
         out['symbol']=sym
     if ('롱' in msg or 'long' in msg) != ('숏' in msg or 'short' in msg):
         out['side']=1 if '롱' in msg or 'long' in msg else -1
@@ -266,6 +281,28 @@ def position_adjustment(p,m,c):
     return stop if improve else old_stop,target if closer else old_target
 
 
+def manual_assessment(m,c):
+    """One vote per independent evidence group, with regime-aware vetoes."""
+    side=c['side']
+    f=m['indicators']
+    ht=m.get('market_direction')
+    measures={
+        '추세': 1 if ht==('상승' if side==1 else '하락') else -1 if ht in ('상승','하락') else 0,
+        '구조': side*m.get('structure_break',0),
+        '수급': side*(f['f15m']['flow']+f['f5m']['flow'])/.12,
+        '모멘텀': side*(f['f15m']['r6'] or 0)/max(f['f15m']['atr'],.001),
+    }
+    supporting=[k for k,v in measures.items() if v>=1]
+    opposing=[k for k,v in measures.items() if v<=-1]
+    if measures['추세']<0:
+        status='conditional' if len(supporting)>=2 else 'watch'
+    elif ht=='횡보':
+        status='entry' if c['confirmed'] and measures['수급']>=1 and not opposing and c['entry_status']=='entry' else 'conditional' if supporting else 'watch'
+    else:
+        status='entry' if c['entry_status']=='entry' and len(supporting)>=2 and not opposing else 'conditional' if supporting else 'watch'
+    return status,supporting,opposing
+
+
 def review(m,context,seed,stamp=None,event=None):
     c=next((x for x in m['directions'] if x['side']==context.get('side')),m['candidate'])
     side=c['side']
@@ -285,6 +322,9 @@ def review(m,context,seed,stamp=None,event=None):
     label='롱' if side==1 else '숏'
     sym=m['symbol'].removesuffix('USDT')
     status=c['entry_status']
+    manual='manual_indicators' in m and event is None
+    supporting=[]; opposing=[]
+    if manual: status,supporting,opposing=manual_assessment(m,c)
     title=('조건부 진입 후보' if status=='conditional' else '즉시 검토 후보' if status=='entry' else '관찰 후보')
     icon='🟢' if side==1 else '🔴'
     rows=[RULE,f'{icon} {sym} {label} {title}']
@@ -314,9 +354,21 @@ def review(m,context,seed,stamp=None,event=None):
     def evidence(items):
         n=1 if mode=='simple' else len(items) if mode=='detailed' else 3
         return ['• '+reason(a,m) for a,_ in items[:n]] or ['• 뚜렷한 근거 없음']
+    if manual:
+        rows.extend([f"• 지지 {fmt(m['support'])} / 저항 {fmt(m['resistance'])}",
+                     f"• 15분 ATR {m['indicators']['f15m']['atr']:.2%} · 선물 순공격 수급 {m['indicators']['f15m']['flow']:+.1%}"])
+        rows.append('• 독립 근거: '+(', '.join(supporting) or '부족')+' / 충돌: '+(', '.join(opposing) or '뚜렷하지 않음'))
+        if status=='conditional' and c['entry_status']=='entry':
+            rows.append('• 대기 기준: 상위 방향과 구조·수급 일치 재확인.')
+        if m.get('manual_change'): rows.append('• 이전 분석 대비: '+m['manual_change'])
+        if mode=='detailed':
+            for group,values in m['manual_indicators'].items():
+                displayed=', '.join(f'{k}: {fmt(v,6)}' for k,v in values.items())
+                rows.append(f'• {group} (참고용): {displayed}')
+            rows.append('• CVD는 15분봉 집계의 24봉 변화량이며 체결장 원본 시계열과 구분합니다.')
     rows.extend(evidence(c['reasons']))
     rows.extend(['','⚠️ 반대 근거 및 위험',*evidence(c['conflicts']),'• '+risk,'','⏳ 진입 조건',
-                 c['trigger'] or '현재 완료 봉에서 직접 검토할 후보',
+                 c['trigger'] or ('상위 방향과 구조·수급 일치 재확인' if manual and status!='entry' else '현재 완료 봉에서 직접 검토할 후보'),
                  '', '❌ 추천 무효화 조건',c['invalidation']])
     if not pr or pr['cap']<1_000_000:
         rows.append('• 100만 원 미만: '+('계좌의 기존 증거금 비중 상한으로 100만 원 배정 불가.' if seed<5_000_000 else
@@ -331,12 +383,19 @@ def review(m,context,seed,stamp=None,event=None):
             rows.append(f"• {fmt(amount,0)}원 / {l}배 · 명목 {fmt(notional,0)}원 · 익절 {fmt(notional*gain if gain is not None else None,0)}원 · 손절 -{fmt(loss_krw,0)}원 ({loss_krw/seed:.2%}) · 청산 {fmt(row['model_liquidation'])} · 스탑 여유 {row['stop_to_liquidation_ratio']:.2%} · "+('가능' if row['cap']>=amount else '위험·증거금 한도 초과'))
     imm=c['immediate_plan']
     if mode!='simple':
-        h=c['historical']; n=h.get('sample',0); hits=h.get('target_hits',0)
+        h=c['historical']
+        if 'manual_indicators' in m and event is None and target:
+            h=live.analog(m['symbol'],m['indicators']['f1h'],side,abs(stop/entry-1),abs(target/entry-1),
+                          m.get('funding'),m.get('oi_change'),entry_offset=entry/m['completed_1m_close']-1)
+        n=h.get('sample',0); hits=h.get('target_hits',0)
         rows.extend(['',RULE,'📚 과거 유사 사례',
             f'• 목표 선도달: {hits}/{n}건 ({hits/n:.1%})' if n else '• 비교 표본 없음',
             f'• 손익분기 승률: {loss/(loss+gain):.1%}' if gain is not None and gain>0 else '• 손익분기 승률: 계산 불가',
             '• 과거 관측치이며 미래 승률과 다릅니다.'+(' 표본이 적어 불확실합니다.' if n<50 else ''),
             f"• 현재가 진입안: {fmt(imm['entry'])} · 손익비 {ratio(imm['payoff'])}"])
+        if 'unfilled' in h:
+            rows.append(f"• 손절 선도달 {h['stop_hits']} · 미도달 {h['unresolved']} · 미체결 {h['unfilled']}")
+            rows.append(f"• 최신 비교 사례 {h['newest_utc'] or '없음'} · 시간봉 보수 체결 · 과거 펀딩 미반영")
         if mode=='detailed':
             opposite=next(x for x in m['directions'] if x['side']!=side)
             rows.extend(['', '⚠️ 반대 방향의 근거',*evidence(opposite['reasons']),
@@ -393,12 +452,14 @@ def handle(message,identity='cmd'):
         if not found: return '등록 번호를 확인하세요.'
         found.update({k:v for k,v in parse(low,{}).items() if k in ('target','stop')})
         put('positions',positions);return '등록 포지션 감시 가격을 갱신했습니다.'
-    report=live.tick(read_only=True,market_api=ORIGINAL_API)
+    position_query=low=='/positions' or '보유 중' in low or '가지고 있어' in low
+    symbols=tuple(dict.fromkeys(p['symbol'] for p in positions)) if position_query else query_symbols(message,context)
+    report=live.tick(read_only=True,market_api=ORIGINAL_API,symbols=symbols)
     end=datetime.fromisoformat(report['completed_through_utc'])
     if abs((datetime.now(timezone.utc)-end).total_seconds())>150:
         return '최신 완료 봉 시각을 검증하지 못해 분석을 보류합니다.'
     markets={m['symbol']:m for m in report['market']}
-    if low=='/positions' or '보유 중' in low or '가지고 있어' in low:
+    if position_query:
         rows=[]
         for p in positions:
             m=markets.get(p['symbol'])
@@ -424,11 +485,22 @@ def handle(message,identity='cmd'):
         if any(k in context for k in ('entry','margin','leverage','stop','target')):
             return '수동 모의 주문은 엔진 기본 가격과 위험 설정을 사용합니다. /simulate eth short default 로 명시적으로 요청하세요.' if ' default' not in low else queue_manual(m,context['side'])
         return queue_manual(m,context['side'])
-    query=markets.values() if low=='/market' or '가장' in low or not context.get('symbol') else [markets[context['symbol']]] if context['symbol'] in markets else []
+    query=[markets[sym] for sym in symbols if sym in markets]
+    single=len(symbols)==1
+    if single and not query:
+        return f'{symbols[0]} 최신 완료 봉을 확보하지 못했습니다.'
+    for market in query:
+        key='manual-view/'+identity+'/'+market['symbol']
+        old=get(key,{})
+        direction=market.get('market_direction','불확실')
+        current=dict(direction=direction,status=market['candidate']['entry_status'])
+        if old and old!=current:
+            market['manual_change']=f"{old['direction']} / {old['status']} → {direction} / {current['status']}"
+        put(key,current)
     note='\n익절가를 높일 경우 비교할 가격을 입력하세요. 예: 익절가 1750' if '익절가를 더' in low else ''
     if '아까' in low or '아직 유효' in low:
         note+='\n이전 제안과 비교할 때는 기존 진입가·손절가를 입력하세요. 현재 양방향 근거와 확인 조건을 다시 계산했습니다.'
-    return ('\n\n'.join(review(m,context if len(query)==1 else {},seed,report['completed_through_utc']) for m in query) or '최신 분봉을 확보하지 못했습니다.')+note
+    return ('\n\n'.join(review(m,context if single else {},seed,report['completed_through_utc']) for m in query) or '최신 분봉을 확보하지 못했습니다.')+note
 
 def queue_manual(m,side):
     ident=secrets.token_hex(6)
