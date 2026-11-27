@@ -1,6 +1,6 @@
 {
   "base": "18.3.1",
-  "bump": "patch",
-  "channel": "rehearsal",
-  "notes": "Signed automatic release rehearsal. Trading code unchanged. This prerelease is excluded from the latest production release."
+  "bump": "minor",
+  "channel": "production",
+  "notes": "V18.4: position-only exit adjustment notifications, daily/4h direction and less repetitive BTC/ETH alerts, existing-risk margin sizing rounded down to KRW 100,000, local position edits. Same-sample alert replay and limitations: ci/v18.4-validation.md. No database migration."
 }

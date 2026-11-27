@@ -85,6 +85,7 @@ def alert_settings():
 
 def category(key):
     if key.startswith('user/') or key.startswith('health/'): return 'important'
+    if key.startswith('paper/manage/'): return 'paper_manage'
     if key.startswith('paper/'): return 'paper'
     if key.startswith('summary/'): return 'summary'
     if key.startswith('idea/'): return 'important'
@@ -94,7 +95,7 @@ def permitted(kind):
     cfg=alert_settings()
     return cfg['mode']!='off' and (kind=='important' or
         (kind=='market' and cfg['mode']=='all') or
-        (kind in ('paper','summary') and cfg[kind]))
+        (kind in ('paper','paper_manage','summary') and cfg.get(kind,False)))
 
 def notify(key,signature,text,detected=None,cooldown=0,force=False):
     kind=category(key)
@@ -131,12 +132,12 @@ def alert_command(command):
     args=command.split()[1:]
     if args in (['important'],['on'],['all'],['off']):
         cfg['mode']='important' if args==['on'] else args[0]
-    elif len(args)==2 and args[0] in ('paper','summary') and args[1] in ('on','off'):
+    elif len(args)==2 and args[0] in ('paper','paper_manage','summary') and args[1] in ('on','off'):
         cfg[args[0]]=args[1]=='on'
     elif args not in ([],['status']):
-        return '/alerts important|all|off|on|status · /alerts paper on|off · /alerts summary on|off'
+        return '/alerts important|all|off|on|status · /alerts paper on|off · /alerts paper_manage on|off · /alerts summary on|off'
     put('alert_settings',cfg)
-    return f"알림 {cfg['mode']} · 모의 {'ON' if cfg['paper'] else 'OFF'} · 요약 {'ON' if cfg['summary'] else 'OFF'}"
+    return f"알림 {cfg['mode']} · 모의 {'ON' if cfg['paper'] else 'OFF'} · 모의 관리 {'ON' if cfg.get('paper_manage',False) else 'OFF'} · 요약 {'ON' if cfg['summary'] else 'OFF'}"
 
 def sender(stop,token,chat):
     delay=2
@@ -181,6 +182,90 @@ def parse(text,prior):
 def fmt(value,d=2):
     return '자료 없음' if value is None else f'{value:,.{d}f}'
 
+def margin_choices(plan,seed,positions,funding=None,requested_leverage=None):
+    """Existing standard caps, with an additional funding and exposure reserve."""
+    risk=0.; reserved=0.
+    for held in positions:
+        margin=held['margin']; lev=held['leverage']; entry=held['entry']
+        reserved+=margin
+        stop=held.get('stop')
+        distance=max(0.,held['side']*(entry-stop)/entry) if stop is not None else 1/lev
+        risk+=margin*lev*(distance+2*live.FEE+live.SLIP+.001)
+    charge=max(.0001,abs(funding or 0.))
+    adjusted=dict(plan,stop_loss_notional=plan['stop_loss_notional']+charge)
+    candidates=profiles(adjusted,seed,max(0.,seed*.01-risk),max(0.,seed*.45-reserved),.01,'standard')['alternatives']
+    if requested_leverage is not None:
+        candidates=[r for r in candidates if r['leverage']==requested_leverage]
+    choices=[]
+    for row in candidates:
+        lev=row['leverage']
+        stress=row['stress_loss_ratio']+(.0005 if lev>=20 else 0.)
+        cap=min(row['notional_krw'],max(0.,seed*.01-risk)/stress)/lev
+        cap=math.floor(cap/100000)*100000
+        if row['stop_to_liquidation_ratio'] < (3 if lev>=20 else 2)*max(plan['atr_ratio'],.001):
+            cap=0
+        choices.append(dict(row,cap=cap,loss_ratio=adjusted['stop_loss_notional']))
+    viable=[r for r in choices if r['cap']>=100000]
+    picked=max(viable,key=lambda r:(r['cap']>=1000000,r['cap']*r['leverage'],-r['leverage'])) if viable else None
+    return picked,choices
+
+
+def signal_context(m,c):
+    direction=m.get('market_direction','불확실')
+    f=m['indicators']
+    side=c['side']
+    evidence=set()
+    if side*(f['f15m']['flow']+f['f5m']['flow'])>.10: evidence.add('flow')
+    if side*f['f1h']['ema']>.001: evidence.add('structure')
+    if f['f15m']['volume']>=1.25 and side*f['f15m']['r6']>0: evidence.add('volume')
+    if m.get('oi_change') is not None and m['oi_change']>.002 and side*f['f15m']['r6']>0: evidence.add('oi')
+    aligned=direction==('상승' if side==1 else '하락')
+    neutral=direction=='횡보' and c['confirmed']
+    structural=m.get('structure_break')==side and 'flow' in evidence and c['entry_status']=='entry'
+    correlated_setup=direction=='불확실' and c['entry_status']=='entry' and c['score']>=2.0 and bool(evidence & {'flow','structure'})
+    return ((aligned or neutral or structural) and len(evidence)>=2) or correlated_setup,evidence
+
+
+def position_edit(parts):
+    with db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row=conn.execute("SELECT value FROM kv WHERE key='positions'").fetchone()
+        active=json.loads(row[0]) if row else []
+        history=conn.execute("SELECT value FROM kv WHERE key='position_history'").fetchone()
+        history=json.loads(history[0]) if history else []
+        ident=int(parts[2])
+        p=next((x for x in active if x['id']==ident),None)
+        if p is None: return '등록 번호를 확인하세요.'
+        previous=dict(p)
+        if parts[1]=='add' and len(parts)==5:
+            price,margin=map(float,parts[3:])
+            if not all(math.isfinite(x) and x>0 for x in (price,margin)): return '가격·증거금은 양수여야 합니다.'
+            p['entry']=(p['margin']+margin)/(p['margin']/p['entry']+margin/price)
+            p['margin']+=margin
+        elif parts[1] in ('reduce','close'):
+            fraction=1. if parts[1]=='close' else float(parts[3])/100 if len(parts)==4 else 0.
+            if not 0<fraction<=1: return '청산 비율은 0 초과 100 이하입니다.'
+            p['margin']*=1-fraction
+            if fraction==1: active.remove(p)
+        else: return '/pos add 번호 가격 증거금원 · /pos reduce 번호 비율 · /pos close 번호'
+        history.append(dict(at=time.time(),operation=parts[1],before=previous,after=dict(p)))
+        conn.executemany('INSERT OR REPLACE INTO kv VALUES (?,?)',
+                         [('positions',json.dumps(active,ensure_ascii=False)),('position_history',json.dumps(history,ensure_ascii=False))])
+    return '실제 등록 포지션 기록을 반영했습니다.'
+
+
+def position_adjustment(p,m,c):
+    current=m['price']
+    side=p['side']
+    threshold=max(.003, c['atr_ratio'])*current
+    old_stop=p.get('stop'); old_target=p.get('target')
+    stop=c['stop']; target=c['target']
+    improve=(old_stop is not None and side*(stop-old_stop)>=threshold and side*(current-stop)>0)
+    closer=(old_target is not None and target is not None and side*(old_target-target)>=threshold and side*(target-current)>0)
+    if not improve and not closer: return None
+    return stop if improve else old_stop,target if closer else old_target
+
+
 def review(m,context,seed,stamp=None,event=None):
     c=next((x for x in m['directions'] if x['side']==context.get('side')),m['candidate'])
     side=c['side']
@@ -190,9 +275,12 @@ def review(m,context,seed,stamp=None,event=None):
     loss=abs(stop/entry-1)+2*live.FEE+live.SLIP
     gain=side*(target/entry-1)-2*live.FEE if target else None
     plan=dict(c,entry=entry,stop=stop,target=target,stop_loss_notional=loss,net_target_return_notional=gain)
-    pr=profiles(plan,seed,seed*.01,seed*.45,.01,'standard')['selected']
+    pr,alternatives=margin_choices(plan,seed,get('positions',[]),m.get('funding'),context.get('leverage'))
+    funding_stress=max(.0001,abs(m.get('funding') or 0.))
+    gain=gain-funding_stress if gain is not None else None
+    loss+=funding_stress
     lev=context.get('leverage',pr['leverage'] if pr else 0)
-    margin=context.get('margin',seed*pr['margin_ratio'] if pr else 0)
+    margin=context.get('margin',pr['cap'] if pr else 0)
     mode=get('format','normal')
     label='롱' if side==1 else '숏'
     sym=m['symbol'].removesuffix('USDT')
@@ -202,7 +290,7 @@ def review(m,context,seed,stamp=None,event=None):
     rows=[RULE,f'{icon} {sym} {label} {title}']
     if event: rows.append(f'• {event}')
     if stamp: rows.append('📅 '+timestamp(stamp)+' · 완료 봉')
-    rows.extend([f"📊 {c['grade']} | 신뢰도 {c['confidence']}",f"현재가 {fmt(m['price'])} USDT",'',RULE,
+    rows.extend([f"📊 {c['grade']} | 신뢰도 {c['confidence']}",f"현재가 {fmt(m['price'])} USDT · 상위 방향 {m.get('market_direction','불확실')}",'',RULE,
                  '🎯 추천 매매 설정' if not context.keys()-{'side'} else '🎯 매매 설정',
                  f'• 진입가: {fmt(entry)}',
                  f'• 레버리지: {lev:g}배' if lev else '• 레버리지: 부적합',
@@ -221,7 +309,7 @@ def review(m,context,seed,stamp=None,event=None):
     def money(r):
         return f'{margin*lev*r:+,.0f}원 ({lev*r:+.2%})' if valid and r is not None else '계산 불가'
     rr=gain/loss if gain is not None else None
-    rows.extend(['','💰 예상 손익 · 증거금 기준',f'• 익절 시: {money(gain)}',f'• 손절 시: {money(-loss)}',
+    rows.extend(['','💰 예상 손익 · 증거금 기준 · 펀딩 1회 가정',f'• 익절 시: {money(gain)}',f'• 손절 시: {money(-loss)}',
                  f'• 손익비: {ratio(rr)}','',RULE,f"{'📈' if side==1 else '📉'} {label} 진입 근거"])
     def evidence(items):
         n=1 if mode=='simple' else len(items) if mode=='detailed' else 3
@@ -230,6 +318,17 @@ def review(m,context,seed,stamp=None,event=None):
     rows.extend(['','⚠️ 반대 근거 및 위험',*evidence(c['conflicts']),'• '+risk,'','⏳ 진입 조건',
                  c['trigger'] or '현재 완료 봉에서 직접 검토할 후보',
                  '', '❌ 추천 무효화 조건',c['invalidation']])
+    if not pr or pr['cap']<1_000_000:
+        rows.append('• 100만 원 미만: '+('계좌의 기존 증거금 비중 상한으로 100만 원 배정 불가.' if seed<5_000_000 else
+            '등록 포지션 반영 후 손절 예산·청산 여유·증거금 상한을 동시에 통과하는 100만 원 설정 없음.'))
+    if context.get('margin') and not any(r['leverage']==lev and r['cap']>=margin for r in alternatives):
+        rows.append('• 입력한 증거금은 자동 추천 위험 범위를 넘는 가정입니다.')
+    if mode=='detailed' and alternatives:
+        rows.append('📊 증거금 비교 · 비용 및 펀딩 1회 스트레스 반영')
+        for amount in (500000,1000000,1500000):
+            row=max(alternatives,key=lambda r:(r['cap']>=amount,r['cap'],-r['leverage']))
+            l=row['leverage']; notional=amount*l; loss_krw=notional*row['loss_ratio']
+            rows.append(f"• {fmt(amount,0)}원 / {l}배 · 명목 {fmt(notional,0)}원 · 익절 {fmt(notional*gain if gain is not None else None,0)}원 · 손절 -{fmt(loss_krw,0)}원 ({loss_krw/seed:.2%}) · 청산 {fmt(row['model_liquidation'])} · 스탑 여유 {row['stop_to_liquidation_ratio']:.2%} · "+('가능' if row['cap']>=amount else '위험·증거금 한도 초과'))
     imm=c['immediate_plan']
     if mode!='simple':
         h=c['historical']; n=h.get('sample',0); hits=h.get('target_hits',0)
@@ -241,7 +340,7 @@ def review(m,context,seed,stamp=None,event=None):
         if mode=='detailed':
             opposite=next(x for x in m['directions'] if x['side']!=side)
             rows.extend(['', '⚠️ 반대 방향의 근거',*evidence(opposite['reasons']),
-                         f"• 일반 대안: {str(pr['leverage'])+'배 / '+fmt(seed*pr['margin_ratio'],0)+'원' if pr else '부적합'}",
+                         f"• 일반 대안: {str(pr['leverage'])+'배 / '+fmt(pr['cap'],0)+'원' if pr else '부적합'}",
                          f"• 시장 상태: {m['regime']} · 판단 점수: {c['score']:.2f}"])
     favored='롱' if m['candidate']['side']==1 else '숏'
     view={'conditional':'조건을 확인한 뒤 진입을 검토합니다.',
@@ -276,7 +375,7 @@ def handle(message,identity='cmd'):
             put('format',args[1])
             return '메시지 상세도: '+args[1]
         return '/format simple | /format normal | /format detailed'
-    if low=='/help': return HELP
+    if low=='/help': return HELP+'\n/pos add 번호 가격 증거금원 · /pos reduce 번호 비율 · /pos close 번호'
     if low=='/status': return json.dumps(get('status',{}),ensure_ascii=False)
     if low=='/paper':
         accounts=latest().get('paper',{}).get('accounts',{})
@@ -286,9 +385,8 @@ def handle(message,identity='cmd'):
             for name,a in accounts.items())
 
     positions=get('positions',[])
-    if low.startswith('/close '):
-        ident=int(low.split()[1]); put('positions',[p for p in positions if p['id']!=ident])
-        return '로컬 감시 목록에서 제거했습니다.'
+    if low.startswith('/pos ') and len(low.split())>=3: return position_edit(low.split())
+    if low.startswith('/close '): return position_edit(['/pos','close',low.split()[1]])
     if low.startswith('/levels '):
         ident=int(low.split()[1])
         found=next((p for p in positions if p['id']==ident),None)
@@ -389,40 +487,53 @@ def publish(report,detected):
             adverse=m['candidate']['side']!=p['side'] and m['candidate']['score']>=1.65
             key=f"user/{p['id']}/thesis"
             if adverse:
-                notify(key,'opposing',f"등록 #{p['id']} 반대 방향 근거 강화 · 구조 기준 검토 TP {fmt(c['target'])} / SL {fmt(c['stop'])}",detected)
+                notify(key,'opposing',f"등록 #{p['id']} 반대 방향 근거 강화 · 보유 위험 재확인",detected)
+                proposal=position_adjustment(p,m,c)
+                if proposal:
+                    stop,target=proposal
+                    size=p['margin']*p['leverage']/p['entry']
+                    delta=lambda new,old: f'{p["side"]*(new-old)*size:+,.0f}원' if new is not None and old is not None else '자료 없음'
+                    oldstop=p.get('stop'); oldtarget=p.get('target')
+                    notify(f"user/{p['id']}/adjust",f'{stop}/{target}',
+                           f"🎯 등록 #{p['id']} 구조 조정 제안\n반대 방향 근거 강화. 실제 가격은 미변경.\n익절 {fmt(oldtarget)} → {fmt(target)} · 손익 변화 {delta(target,oldtarget)}\n손절 {fmt(oldstop)} → {fmt(stop)} · 손익 변화 {delta(stop,oldstop)}\n손절 위험 확대 없음 · 수수료·갭 제외",detected,cooldown=1800)
             else:
                 with db() as conn: conn.execute('DELETE FROM alerts WHERE key=?',(key,))
+        direction_key='last-alert-direction/'+m['symbol']
+        last_direction=get(direction_key)
         for c in m['directions']:
             key=f"idea/{m['symbol']}/{c['side']}"
             old=get(key,{})
-            active=c['candidate_visible']
-            level_hit=bool(c['entry_status']=='entry' and abs(m['price']/c['entry']-1)<=max(.001,.35*c['atr_ratio']))
-            reasons=sorted(r[0] for r in c['reasons'][:2])
-            current=dict(active=active,status=c['entry_status'],reasons=reasons,entry=c['entry'],target=c['target'],
-                         stop=c['stop'],hit=level_hit,favored=m['candidate']['side']==c['side'] and m['candidate']['score']>=1.65)
-            if old:
-                scale=max(.003*c['entry'],c['atr_ratio']*c['entry'])
-                changed=any(
-                    old.get(k) is not None and current[k] is not None and abs(old[k]-current[k])>=scale
-                    for k in ('target','stop'))
-                label=('후보 무효화' if old['active'] and not active and c['side']*(m['completed_1m_close']-old['stop'])<=0 else
-                       '진입 조건 충족' if active and old['status']!='entry' and current['status']=='entry' else
-                       '진입가 도달·근거 재확인' if level_hit and not old['hit'] else
-                       '우세 방향 변경' if active and current['favored'] and not old['favored'] else
-                       '익절·손절 유의미한 변경' if active and old['active'] and changed else '')
-            else: label=''
-            if label or (active and (not old.get('active') or old.get('reasons')!=reasons)):
-                signature=json.dumps([label,current['status'],reasons,round(c['target'] or 0,2),round(c['stop'],2)] if label else [current['status'],reasons])
-                if label=='후보 무효화':
-                    body=f"❌ {m['symbol']} {'롱' if c['side']==1 else '숏'} 후보 무효화\n📅 {timestamp(stamp)}\n현재가 {fmt(m['price'])} · 이전 손절 기준 {fmt(old['stop'])}"
-                elif label=='익절·손절 유의미한 변경':
-                    direction='롱' if c['side']==1 else '숏'
-                    body=(f"🎯 {m['symbol']} {direction} 익절·손절 변경\n📅 {timestamp(stamp)} · 완료 봉\n"
-                          f"• 현재가: {fmt(m['price'])} USDT\n• 익절: {fmt(old['target'])} → {fmt(c['target'])}\n"
-                          f"• 손절: {fmt(old['stop'])} → {fmt(c['stop'])}\n• 무효화: {c['invalidation']}")
+            supported,evidence=signal_context(m,c)
+            aligned=m.get('market_direction')==('상승' if c['side']==1 else '하락')
+            reversing=last_direction is not None and last_direction!=c['side']
+            reversal_ok=(aligned and len(evidence)>=2) or (m.get('structure_break')==c['side'] and len(evidence)>=2)
+            active=c['candidate_visible'] and supported and (not reversing or reversal_ok)
+            structure=m.get('market_direction','불확실')
+            current=dict(active=active,status=c['entry_status'],stop=c['stop'],
+                         direction=structure,evidence=sorted(evidence))
+            invalid=bool(old.get('active') and not active and old.get('stop') and
+                         c['side']*(m['completed_1m_close']-old['stop'])<=0)
+            conflict=structure!=('상승' if c['side']==1 else '하락') and structure!='횡보'
+            confirmed=bool(active and not conflict and c['entry_status']=='entry' and old.get('status')!='entry')
+            shifted=bool(active and old.get('direction') and old['direction']!=structure and
+                         structure in ('상승','하락') and len(evidence)>=2)
+            significant=bool(active and old.get('active') and old.get('evidence')!=current['evidence'] and
+                             len(evidence-set(old.get('evidence',[])))>=2)
+            new=active and not old.get('active')
+            if invalid:
+                notify(key,'invalid/'+str(old['stop']),f"❌ {m['symbol']} 후보 무효화 · {timestamp(stamp)}",detected,force=True)
+            elif confirmed or shifted or significant or new:
+                label='진입 조건 충족' if confirmed else '상위 방향 변경' if shifted else '구조·수급 확인'
+                signature=json.dumps([structure,c['entry_status'],current['evidence']])
+                if conflict:
+                    shown=dict(c,entry_status='conditional',grade='상위 시간대 충돌 · 조건부',
+                               trigger='15분 구조 돌파 유지와 상위 시간대 방향 재확인')
+                    display=dict(m,directions=[shown if x['side']==c['side'] else x for x in m['directions']])
                 else:
-                    body=review(m,dict(side=c['side']),get('seed',3_000_000),stamp,label or '신규 매매 후보')
-                notify(key,signature,body,detected,cooldown=1800,force=bool(label))
+                    display=m
+                notify(key,signature,review(display,dict(side=c['side']),get('seed',3_000_000),stamp,label),
+                       detected,cooldown=1800,force=bool(confirmed or shifted))
+                put(direction_key,c['side'])
             put(key,current)
     grouped={}
     for e in report.get('paper',{}).get('events',[]):
@@ -433,7 +544,8 @@ def publish(report,detected):
     for batch in grouped.values():
         ids='/'.join(sorted(str(e.get('id')) for e in batch))
         e=batch[0]
-        key=f"paper/{e['kind']}/{ids}/{e.get('branch')}"
+        prefix='paper/manage' if e['kind'] in ('thesis_review','exit_revision') else 'paper'
+        key=f"{prefix}/{e['kind']}/{ids}/{e.get('branch')}"
         notify(key,key,f"모의 {e['kind']} · {e.get('symbol','')} · "+', '.join(str(x.get('account')) for x in batch),detected)
     if healthy:
         hour=stamp[:13]
