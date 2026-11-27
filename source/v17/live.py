@@ -100,7 +100,24 @@ def structure(f):
     return ([float(l[i]) for i in range(2,len(f)-2) if l[i]==min(l[i-2:i+3])],
             [float(h[i]) for i in range(2,len(f)-2) if h[i]==max(h[i-2:i+3])])
 
-def analog(sym,snapshot,side,stop,target,current_funding=None,current_oi=None):
+def analog_path(path,entry,side,stop,target):
+    filled=False
+    for hour,(hi,lo,_) in enumerate(path,1):
+        adverse=lo if side==1 else hi
+        favorable=hi if side==1 else lo
+        fresh=not filled
+        if fresh:
+            if hour>3: break
+            if side*(entry-adverse)<=entry*PEN: continue
+            filled=True
+        if side*(entry-adverse)>=entry*stop:
+            # Opens and tick order are absent: use the adverse extreme for stops.
+            return 'stop_hits',side*(adverse*(1-side*SLIP)/entry-1)-2*FEE
+        if not fresh and side*(favorable-entry)>entry*(target+PEN):
+            return 'target_hits',target-2*FEE
+    return ('unresolved' if filled else 'unfilled'),None
+
+def analog(sym,snapshot,side,stop,target,current_funding=None,current_oi=None,entry_offset=None):
     if not ANALOG.exists(): return {'status':'archive unavailable'}
     with np.load(ANALOG) as z:
         f=z[sym+'_features']; p=z[sym+'_prices']; clock=z[sym+'_clock']
@@ -117,11 +134,24 @@ def analog(sym,snapshot,side,stop,target,current_funding=None,current_oi=None):
         adj=np.minimum(2.,abs(historical_oi-current_oi)/.015)
         dist+=.12*np.where(np.isfinite(adj),adj,1.)
     dist[-48:]=np.nan
+    if entry_offset is not None:
+        for col,threshold in ((2,.001),(5,.06)):
+            if abs(current[col])>=threshold:
+                dist[np.sign(f[:,col])!=np.sign(current[col])]=np.nan
     chosen=[]
     for i in np.argsort(dist):
         if not np.isfinite(dist[i]) or dist[i]>2.5: break
         if all(abs(i-j)>48 for j in chosen): chosen.append(i)
         if len(chosen)==30: break
+    if entry_offset is not None:
+        counts=dict(target_hits=0,stop_hits=0,unresolved=0,unfilled=0)
+        resolved=[]
+        for i in chosen:
+            label,result=analog_path(p[i+1:i+49],p[i,2]*(1+entry_offset),side,stop,target)
+            counts[label]+=1
+            if result is not None: resolved.append(result)
+        return dict(sample=len(chosen),**counts,mean_resolved_net=float(np.mean(resolved)) if resolved else None,
+                    newest_utc=datetime.fromtimestamp(int(clock[max(chosen)])/1000,timezone.utc).date().isoformat() if chosen else None)
     outcomes=[]
     for i in chosen:
         close=p[i,2]; adverse=0.; end='unresolved'
@@ -418,12 +448,45 @@ def fetch_candles_at(fetch, args, cutoff):
     time.sleep(.7)
     return fetch(host,path,**dict(params,endTime=expected+step-1))
 
-def tick(quiet=False, read_only=False, market_api=None, manual_request=None):
+def manual_indicators(bars,raw,end):
+    """Keep corroborating observations separate from automated score votes."""
+    b=bars['f15m']
+    close=b.c
+    previous=close.shift()
+    tr=pd.concat([b.h-b.l,(b.h-previous).abs(),(b.l-previous).abs()],axis=1).max(axis=1)
+    up=b.h.diff(); down=-b.l.diff()
+    smooth=lambda v:v.ewm(alpha=1/14,adjust=False).mean()
+    atr=smooth(tr).replace(0,np.nan)
+    plus=100*smooth(up.where((up>down)&(up>0),0))/atr
+    minus=100*smooth(down.where((down>up)&(down>0),0))/atr
+    adx=smooth(100*(plus-minus).abs()/(plus+minus).replace(0,np.nan))
+    center=close.rolling(20).mean()
+    box=b.iloc[-21:-1]
+    spot=optional(raw,'s15m',lambda x:frame(x,end).iloc[-1].to_dict())
+    day=optional(raw,'f1d',lambda x:frame(x,end).iloc[-1].to_dict())
+    if day and day['t']!=(end//(1440*MIN)-1)*1440*MIN: day=None
+    hourly=bars['f1h']
+    today=hourly[hourly.t==end//(1440*MIN)*(1440*MIN)]
+    oi=optional(raw,'oi',lambda x:float(x[-1]['sumOpenInterest']) if 0<=end-int(x[-1]['timestamp'])<=45*MIN else None)
+    return finite(dict(
+        trend=dict(ADX=adx.iloc[-1],plus_DI=plus.iloc[-1],minus_DI=minus.iloc[-1],SMA20=center.iloc[-1]),
+        momentum=dict(ROC12_percent=close.pct_change(12).iloc[-1]*100),
+        volatility=dict(BB_width_percent=400*close.rolling(20).std(ddof=0).iloc[-1]/center.iloc[-1],
+                        realized_15m_percent=100*close.pct_change().tail(24).std()),
+        structure=dict(Donchian_low=box.l.min(),Donchian_high=box.h.max(),
+                       previous_UTC_day_high=day['h'] if day else None,previous_UTC_day_low=day['l'] if day else None,
+                       UTC_day_open=today.o.iloc[0] if not today.empty else None),
+        flow=dict(aggregated_CVD24=float((2*b.buy-b.v).tail(24).sum())),
+        derivatives=dict(OI=oi,basis_percent=100*(close.iloc[-1]/spot['c']-1) if spot and spot['t']==b.t.iloc[-1] else None)))
+
+def tick(quiet=False, read_only=False, market_api=None, manual_request=None, symbols=None):
     market_api=market_api or api
     end=int(market_api(FUT,'/fapi/v1/time')['serverTime'])//MIN*MIN
     if abs(time.time()*1000-end)>150000:
         raise ValueError('Exchange time is stale')
-    jobs={(sym,key):args for sym in SYMS for key,args in tasks(sym).items()}
+    selected=tuple(symbols) if read_only and symbols else SYMS
+    jobs={(sym,key):args for sym in SYMS for key,args in tasks(sym).items()
+          if sym in selected or key=='f1h'}
     raw={s:{} for s in SYMS}; errors={}
     with ThreadPoolExecutor(max_workers=6) as pool:
         futures={k:pool.submit(fetch_candles_at,market_api,args,end) for k,args in jobs.items()}
@@ -438,13 +501,19 @@ def tick(quiet=False, read_only=False, market_api=None, manual_request=None):
         val=optional(raw[sym],'f1h',lambda x:float(frame(x,end).c.pct_change(6).iloc[-1]))
         if val is not None: marks[sym]=val
     markets=[]; candles={}
-    for sym in SYMS:
+    for sym in selected:
         try:
             other=SYMS[1-SYMS.index(sym)]
             relative=marks[sym]-marks[other] if sym in marks and other in marks else None
             market, candle=analyze(sym,raw[sym],end,relative)
             if market['last_open_ms']!=end-MIN:
                 raise ValueError('latest completed 1m bar missing')
+            if read_only:
+                try:
+                    closed={k:frame(raw[sym][k],end) for k in ('f15m','f1h')}
+                    market['manual_indicators']=manual_indicators(closed,raw[sym],end)
+                except (ArithmeticError,ValueError,IndexError,TypeError,KeyError):
+                    market['manual_indicators']={}
             markets.append(market); candles[sym]=candle
         except (KeyError,ValueError,IndexError,TypeError,ArithmeticError) as ex:
             errors[sym]=str(ex)
