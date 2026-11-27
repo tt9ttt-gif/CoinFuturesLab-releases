@@ -43,7 +43,8 @@ class ReleaseChecks(unittest.TestCase):
         m,c=sample()
         self.assertTrue(app.signal_context(m,c)[0])
         m['market_direction']='불확실'
-        self.assertFalse(app.signal_context(m,c)[0])
+        self.assertTrue(app.signal_context(m,c)[0])  # strong lower-frame setup remains conditional
+        self.assertFalse(app.signal_context(m,dict(c,score=.5))[0])
         held=dict(side=-1,stop=101,target=90)
         self.assertIsNone(app.position_adjustment(held,m,dict(c,stop=103)))
         self.assertEqual(app.live.market_direction(.004,-.01),'불확실')
