@@ -498,11 +498,16 @@ def publish(report,detected):
                            f"🎯 등록 #{p['id']} 구조 조정 제안\n반대 방향 근거 강화. 실제 가격은 미변경.\n익절 {fmt(oldtarget)} → {fmt(target)} · 손익 변화 {delta(target,oldtarget)}\n손절 {fmt(oldstop)} → {fmt(stop)} · 손익 변화 {delta(stop,oldstop)}\n손절 위험 확대 없음 · 수수료·갭 제외",detected,cooldown=1800)
             else:
                 with db() as conn: conn.execute('DELETE FROM alerts WHERE key=?',(key,))
+        direction_key='last-alert-direction/'+m['symbol']
+        last_direction=get(direction_key)
         for c in m['directions']:
             key=f"idea/{m['symbol']}/{c['side']}"
             old=get(key,{})
             supported,evidence=signal_context(m,c)
-            active=c['candidate_visible'] and supported
+            aligned=m.get('market_direction')==('상승' if c['side']==1 else '하락')
+            reversing=last_direction is not None and last_direction!=c['side']
+            reversal_ok=(aligned and len(evidence)>=2) or (m.get('structure_break')==c['side'] and len(evidence)>=2)
+            active=c['candidate_visible'] and supported and (not reversing or reversal_ok)
             structure=m.get('market_direction','불확실')
             current=dict(active=active,status=c['entry_status'],stop=c['stop'],
                          direction=structure,evidence=sorted(evidence))
@@ -528,6 +533,7 @@ def publish(report,detected):
                     display=m
                 notify(key,signature,review(display,dict(side=c['side']),get('seed',3_000_000),stamp,label),
                        detected,cooldown=1800,force=bool(confirmed or shifted))
+                put(direction_key,c['side'])
             put(key,current)
     grouped={}
     for e in report.get('paper',{}).get('events',[]):
