@@ -288,7 +288,7 @@ def position_review(p,m,seed):
     lines=[f"📌 등록 #{p['id']} {p['symbol']} · {action}",
            f"⚠️ {state} · 상위 방향 {m.get('market_direction','불확실')} · 구조 {'역행' if structure else '이탈 미확인'}",
            f"현재 {fmt(price)} / 등록가 {fmt(p['entry'])} · {'롱' if side==1 else '숏'}",
-           f"지지 {fmt(m['support'])} / 저항 {fmt(m['resistance'])} · 손절 {fmt(stop)}",
+           f"지지 {fmt(m.get('support'))} / 저항 {fmt(m.get('resistance'))} · 손절 {fmt(stop)}",
            f"레버리지 {fmt(lev,0)} / 증거금 {fmt(margin,0)}원 · 모형 청산가 {fmt(liq)}",
            f"펀딩 제외 추정 손익 {fmt(pnl,0)}원"+(f" · 시드 대비 {pnl/seed:+.2%}" if pnl is not None else ''),
            '등록값 기준 추정 · 거래소 체결 미확인']
@@ -840,7 +840,12 @@ def publish(report,detected):
             state,body=position_review(p,m,get('seed',3_000_000))
             key=f"user/{p['id']}/thesis"
             if state!='유지':
-                notify(key,state,body,detected,force=True)
+                details=body.splitlines()
+                adjustments=[line for line in details if '조정 검토 ' in line]
+                notify(key,state,'\n'.join(line for line in details if line not in adjustments),detected,force=True)
+                if adjustments:
+                    notify(f"user/{p['id']}/adjust",'|'.join(line.split(' · ',1)[0] for line in adjustments),
+                           f"등록 #{p['id']} 가격 조정 검토 · {state}\n"+'\n'.join(adjustments),detected,cooldown=1800)
             else:
                 with db() as conn: conn.execute('DELETE FROM alerts WHERE key=?',(key,))
         direction_key='last-alert-direction/'+m['symbol']
