@@ -25,6 +25,7 @@ jobs:
       - run: python ci/test_v184.py
       - run: python ci/test_v185.py
       - run: python ci/test_v186.py
+      - run: python ci/test_v187.py
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: validate

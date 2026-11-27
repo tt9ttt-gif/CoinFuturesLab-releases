@@ -20,7 +20,7 @@ class RegistrationTests(unittest.TestCase):
             self.addCleanup(change.stop)
 
     def test_missing_direction_and_amounts(self):
-        self.assertIn('롱인가요',app.handle('이더 진입가 1700'))
+        self.assertIn('롱인가요',app.handle('이더 진입가 1700 진입했어'))
         self.assertEqual(app.get('positions',[]),[])
         self.assertIn('미입력',app.handle('숏'))
         p,=app.get('positions')
@@ -31,19 +31,19 @@ class RegistrationTests(unittest.TestCase):
 
     def test_context_requires_confirmation(self):
         app.put('context/cmd',{'symbol':'BTCUSDT','side':1,'margin':1000000})
-        self.assertIn('확인',app.handle('비트 진입가 61000'))
+        self.assertIn('확인',app.handle('비트 진입가 61000 진입했어'))
         self.assertEqual(app.get('positions',[]),[])
         app.handle('확인')
         self.assertIsNone(app.get('positions')[0].get('margin'))
 
     def test_collision_close_and_preservation(self):
-        app.handle('비트 롱 62000 20배 증거금 100만원')
+        app.handle('비트 롱 62000 20배 증거금 100만원 진입했어')
         p,=app.get('positions')
         self.assertEqual((p['entry'],p['leverage'],p['margin']),(62000,20,1000000))
-        self.assertIn('수정 번호',app.handle('비트 롱 진입가 61000'))
+        self.assertIn('수정 번호',app.handle('비트 롱 진입가 61000 진입했어'))
         app.handle('수정 '+str(p['id']))
         self.assertEqual(app.get('positions')[0]['margin'],1000000)
-        app.handle('이더 숏 진입가 1750')
+        app.handle('이더 숏 진입가 1750 진입했어')
         self.assertIn('선택',app.handle('거래종료'))
         app.handle('비트 거래종료')
         remaining,=app.get('positions')
@@ -56,7 +56,7 @@ class RegistrationTests(unittest.TestCase):
     def test_reservation_does_not_change_positions_or_paper(self):
         self.assertIn('롱인가요',app.handle('이더 1680에 지정가 걸어두면 어떨까?'))
         with patch.object(app,'manual_market',return_value=({'symbol':'ETHUSDT'},'now')), patch.object(app,'reservation_review',return_value='조건부 가능') as review:
-            self.assertEqual(app.handle('롱'),'조건부 가능')
+            self.assertIn('조건부 가능',app.handle('롱'))
             self.assertEqual(review.call_args.args[1]['entry'],1680)
         self.assertEqual(app.get('positions',[]),[])
         self.assertIsNone(app.get('manual_request'))
@@ -64,7 +64,7 @@ class RegistrationTests(unittest.TestCase):
 
     def test_missing_market_keeps_registration_and_recovery(self):
         with patch.object(app,'manual_market',side_effect=TimeoutError):
-            self.assertIn('기록은 저장',app.handle('이더 숏 진입가 1750'))
+            self.assertIn('기록은 저장',app.handle('이더 숏 진입가 1750 진입했어'))
         p,=app.get('positions')
         c={'side':-1,'atr_ratio':.01,'stop':1800,'target':1600}
         market={'symbol':'ETHUSDT','price':1740,'support':1700,'resistance':1800,

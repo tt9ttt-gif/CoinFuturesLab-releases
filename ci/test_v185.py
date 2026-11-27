@@ -30,7 +30,7 @@ class ManualTests(unittest.TestCase):
             with patch.object(app,'get',side_effect=lambda k,d=None:d),patch.object(app,'put'),\
                  patch.object(app.live,'tick',return_value=dict(completed_through_utc=now,market=[dict(symbol=s,candidate={'entry_status':'watch'}) for s in app.live.SYMS])) as tick,\
                  patch.object(app,'review',side_effect=lambda m,*a:m['symbol']):
-                self.assertEqual(app.handle(text),want)
+                self.assertEqual(app.handle(text).splitlines()[-1],want)
                 self.assertEqual(tick.call_args.kwargs['symbols'],(want,))
 
     def test_analog_order_and_costs(self):

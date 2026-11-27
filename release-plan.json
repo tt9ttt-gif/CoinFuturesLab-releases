@@ -1,6 +1,6 @@
 {
-  "base": "18.5.0",
+  "base": "18.6.0",
   "bump": "minor",
   "channel": "production",
-  "notes": "V18.6: local position registration and closure, read-only limit-entry analysis, decision-first messages, and separate Telegram polling, analysis and reply workers."
+  "notes": "V18.7 separates entry analysis from local position management, parses currency and amount type, and preserves user-reported realized P&L on closure."
 }
