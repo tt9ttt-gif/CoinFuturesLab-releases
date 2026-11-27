@@ -303,7 +303,15 @@ def analyze(sym,raw,end,relative):
     previous=recent.iloc[-13:-1]
     breakout=1 if recent.c.iloc[-1]>previous.h.max()+.15*atr else -1 if recent.c.iloc[-1]<previous.l.min()-.15*atr else 0
     best=max(decisions,key=lambda x:x['score'])
+    if daily is not None:
+        f['f1d']={'ema':daily}
+    cvd=float((2*recent.buy-recent.v).tail(24).sum())
+    change=float(recent.c.iloc[-1]/recent.c.iloc[-25]-1)
+    divergence=('상승 가격·순매도' if change>0 and cvd<0 else
+                '하락 가격·순매수' if change<0 and cvd>0 else '방향 불일치 미관측')
     return dict(symbol=sym,price=current,completed_1m_close=price,last_open_ms=int(bars['f1m'].t.iloc[-1]),regime=regime,market_direction=market_direction(daily,longer['ema']),structure_break=breakout,
+                position_cvd24=cvd,position_cvd_divergence=divergence,
+                position_mark_price=optional(raw,'funding',lambda x:float(x['markPrice']) if abs(int(x['time'])-end)<=180000 else None),
                 support=lower,resistance=upper,indicators=f,spot_flow=spot_flow,oi_change=oi_delta,funding=funding,
                 long_short=crowd_ratio,book_imbalance=imbalance,volume_profile_proxy_poc=profile_poc,
                 mark_price=optional(raw,'funding',lambda x:float(x['markPrice'])),
