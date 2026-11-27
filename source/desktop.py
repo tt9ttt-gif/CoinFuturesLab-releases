@@ -220,8 +220,10 @@ def signal_context(m,c):
     if f['f15m']['volume']>=1.25 and side*f['f15m']['r6']>0: evidence.add('volume')
     if m.get('oi_change') is not None and m['oi_change']>.002 and side*f['f15m']['r6']>0: evidence.add('oi')
     aligned=direction==('상승' if side==1 else '하락')
-    neutral=direction=='횡보' and c['confirmed'] and len(evidence)>=2
-    return (aligned or neutral) and len(evidence)>=2,evidence
+    neutral=direction=='횡보' and c['confirmed']
+    structural=m.get('structure_break')==side and 'flow' in evidence and c['entry_status']=='entry'
+    correlated_setup=direction=='불확실' and c['entry_status']=='entry' and c['score']>=2.0 and bool(evidence & {'flow','structure'})
+    return ((aligned or neutral or structural) and len(evidence)>=2) or correlated_setup,evidence
 
 
 def position_edit(parts):
@@ -274,6 +276,9 @@ def review(m,context,seed,stamp=None,event=None):
     gain=side*(target/entry-1)-2*live.FEE if target else None
     plan=dict(c,entry=entry,stop=stop,target=target,stop_loss_notional=loss,net_target_return_notional=gain)
     pr,alternatives=margin_choices(plan,seed,get('positions',[]),m.get('funding'),context.get('leverage'))
+    funding_stress=max(.0001,abs(m.get('funding') or 0.))
+    gain=gain-funding_stress if gain is not None else None
+    loss+=funding_stress
     lev=context.get('leverage',pr['leverage'] if pr else 0)
     margin=context.get('margin',pr['cap'] if pr else 0)
     mode=get('format','normal')
@@ -304,7 +309,7 @@ def review(m,context,seed,stamp=None,event=None):
     def money(r):
         return f'{margin*lev*r:+,.0f}원 ({lev*r:+.2%})' if valid and r is not None else '계산 불가'
     rr=gain/loss if gain is not None else None
-    rows.extend(['','💰 예상 손익 · 증거금 기준',f'• 익절 시: {money(gain)}',f'• 손절 시: {money(-loss)}',
+    rows.extend(['','💰 예상 손익 · 증거금 기준 · 펀딩 1회 가정',f'• 익절 시: {money(gain)}',f'• 손절 시: {money(-loss)}',
                  f'• 손익비: {ratio(rr)}','',RULE,f"{'📈' if side==1 else '📉'} {label} 진입 근거"])
     def evidence(items):
         n=1 if mode=='simple' else len(items) if mode=='detailed' else 3
@@ -314,7 +319,8 @@ def review(m,context,seed,stamp=None,event=None):
                  c['trigger'] or '현재 완료 봉에서 직접 검토할 후보',
                  '', '❌ 추천 무효화 조건',c['invalidation']])
     if not pr or pr['cap']<1_000_000:
-        rows.append('• 100만 원 미만: 기존 증거금 상한, 등록 포지션 위험, 손절 예산과 청산 여유를 모두 적용.')
+        rows.append('• 100만 원 미만: '+('계좌의 기존 증거금 비중 상한으로 100만 원 배정 불가.' if seed<5_000_000 else
+            '등록 포지션 반영 후 손절 예산·청산 여유·증거금 상한을 동시에 통과하는 100만 원 설정 없음.'))
     if context.get('margin') and not any(r['leverage']==lev and r['cap']>=margin for r in alternatives):
         rows.append('• 입력한 증거금은 자동 추천 위험 범위를 넘는 가정입니다.')
     if mode=='detailed' and alternatives:
@@ -322,7 +328,7 @@ def review(m,context,seed,stamp=None,event=None):
         for amount in (500000,1000000,1500000):
             row=max(alternatives,key=lambda r:(r['cap']>=amount,r['cap'],-r['leverage']))
             l=row['leverage']; notional=amount*l; loss_krw=notional*row['loss_ratio']
-            rows.append(f"• {fmt(amount,0)}원 / {l}배 · 명목 {fmt(notional,0)}원 · 익절 {fmt(notional*(gain-max(.0001,abs(m.get('funding') or 0.))) if gain is not None else None,0)}원 · 손절 -{fmt(loss_krw,0)}원 ({loss_krw/seed:.2%}) · 청산 {fmt(row['model_liquidation'])} · 스탑 여유 {row['stop_to_liquidation_ratio']:.2%} · "+('가능' if row['cap']>=amount else '위험·증거금 한도 초과'))
+            rows.append(f"• {fmt(amount,0)}원 / {l}배 · 명목 {fmt(notional,0)}원 · 익절 {fmt(notional*gain if gain is not None else None,0)}원 · 손절 -{fmt(loss_krw,0)}원 ({loss_krw/seed:.2%}) · 청산 {fmt(row['model_liquidation'])} · 스탑 여유 {row['stop_to_liquidation_ratio']:.2%} · "+('가능' if row['cap']>=amount else '위험·증거금 한도 초과'))
     imm=c['immediate_plan']
     if mode!='simple':
         h=c['historical']; n=h.get('sample',0); hits=h.get('target_hits',0)
@@ -502,7 +508,8 @@ def publish(report,detected):
                          direction=structure,evidence=sorted(evidence))
             invalid=bool(old.get('active') and not active and old.get('stop') and
                          c['side']*(m['completed_1m_close']-old['stop'])<=0)
-            confirmed=bool(active and c['entry_status']=='entry' and old.get('status')!='entry')
+            conflict=structure!=('상승' if c['side']==1 else '하락') and structure!='횡보'
+            confirmed=bool(active and not conflict and c['entry_status']=='entry' and old.get('status')!='entry')
             shifted=bool(active and old.get('direction') and old['direction']!=structure and
                          structure in ('상승','하락') and len(evidence)>=2)
             significant=bool(active and old.get('active') and old.get('evidence')!=current['evidence'] and
@@ -513,7 +520,13 @@ def publish(report,detected):
             elif confirmed or shifted or significant or new:
                 label='진입 조건 충족' if confirmed else '상위 방향 변경' if shifted else '구조·수급 확인'
                 signature=json.dumps([structure,c['entry_status'],current['evidence']])
-                notify(key,signature,review(m,dict(side=c['side']),get('seed',3_000_000),stamp,label),
+                if conflict:
+                    shown=dict(c,entry_status='conditional',grade='상위 시간대 충돌 · 조건부',
+                               trigger='15분 구조 돌파 유지와 상위 시간대 방향 재확인')
+                    display=dict(m,directions=[shown if x['side']==c['side'] else x for x in m['directions']])
+                else:
+                    display=m
+                notify(key,signature,review(display,dict(side=c['side']),get('seed',3_000_000),stamp,label),
                        detected,cooldown=1800,force=bool(confirmed or shifted))
             put(key,current)
     grouped={}
