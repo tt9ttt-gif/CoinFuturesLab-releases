@@ -1,0 +1,45 @@
+name: Publish a signed CoinFuturesLab release
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Numeric version (example 18.3.1)
+        required: true
+        type: string
+      notes:
+        description: Release notes
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: signed-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install signing dependency
+        run: python -m pip install 'cryptography>=44,<52'
+      - name: Sign allowlisted files
+        env:
+          PRIVATE_KEY_B64: ${{ secrets.COIN_RELEASE_SIGNING_KEY }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+        run: |
+          set -eu
+          umask 077
+          secret_file="$(mktemp)"
+          trap 'rm -f "$secret_file"' EXIT
+          printf '%s' "$PRIVATE_KEY_B64" | base64 --decode > "$secret_file"
+          python source/autoupdate.py publish --source source --output release --key "$secret_file" --version "$RELEASE_VERSION" --notes "$RELEASE_NOTES"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+        run: |
+          gh release create "v$RELEASE_VERSION" release/CoinFuturesLab-update.zip --repo "$GITHUB_REPOSITORY" --title "CoinFuturesLab $RELEASE_VERSION" --notes "$RELEASE_NOTES" --latest
