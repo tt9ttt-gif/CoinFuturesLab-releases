@@ -503,6 +503,9 @@ def review(m,context,seed,stamp=None,event=None):
     manual='manual_indicators' in m and event is None
     supporting=[]; opposing=[]
     if manual: status,supporting,opposing=manual_assessment(m,c)
+    if context.get('reservation'):
+        status='watch' if context['reservation']=='비추천' else 'conditional'
+        c=dict(c,trigger=context['reservation_trigger'],invalidation=context['reservation_invalidation'])
     title=('조건부 진입 후보' if status=='conditional' else '즉시 검토 후보' if status=='entry' else '관찰 후보')
     icon='🟢' if side==1 else '🔴'
     rows=[RULE,f'{icon} {sym} {label} {title}',
@@ -608,14 +611,18 @@ def reservation_review(m,fields,seed,stamp):
     target=fields.get('target',opposite_level if side*(opposite_level-entry)>entry*atr else entry*(1+side*atr*2))
     if side*(entry-stop)<=0 or side*(target-entry)<=0 or min(stop,target)<=0:
         status='비추천'
-    plan=dict(fields,stop=stop,target=target)
+    trigger=('현재가 기준 주문이 즉시 체결될 수 있어 대기 가격을 재검토하세요.' if marketable else
+             '예약가 부근에서 '+('지지 회복 및 매수 우세' if side==1 else '저항 유지 및 매도 우세')+
+             '를 확인하세요. 가격 도달만으로 체결을 확인할 수 없습니다.')
+    invalidation=f"{fmt(stop)} {'하향' if side==1 else '상향'} 이탈 또는 상위 구조·수급의 반대 방향 전환"
+    plan=dict(fields,stop=stop,target=target,reservation=status,
+              reservation_trigger=trigger,reservation_invalidation=invalidation)
     return '\n'.join([
         f"📌 {m['symbol']} {'롱' if side==1 else '숏'} 예약 판단 · {status}",
         f"현재 {fmt(current)} → 예약 {fmt(entry)} USDT ({offset:+.2%})",
         f"지지 {fmt(support)} / 저항 {fmt(resistance)} · {'인접 구조 있음' if near else '인접 구조 미확인'}",
-        ('현재가 기준 즉시 체결 가능한 지정가입니다. 대기 진입 목적이라면 가격을 재검토하세요.' if marketable else
-         '예약가 부근에서 '+('지지 회복 및 매수 우세' if side==1 else '저항 유지 및 매도 우세')+'를 확인하세요. 가격 도달만으로 체결을 확인할 수 없습니다.'),
-        f"취소 기준 · {fmt(stop)} 방향으로 구조 이탈 또는 {c['invalidation']}",
+        '예약 조건 · '+trigger,
+        '취소 기준 · '+invalidation,
         review(m,plan,seed,stamp),
     ])
 
@@ -894,7 +901,8 @@ WS_LOCK=threading.Lock()
 ORIGINAL_API=live.api
 
 def manual_rest(host,path,**query):
-    return ORIGINAL_API(host,path,timeout=5,**query)
+    required=path in ('/fapi/v1/time','/fapi/v1/klines')
+    return ORIGINAL_API(host,path,timeout=10 if required else 5,**query)
 
 def monitor_api(host,path,*,fetch_rest=ORIGINAL_API,**query):
     if path!='/fapi/v1/klines' or 'startTime' in query or 'endTime' in query or query.get('interval') not in ('1m','5m','15m'):
