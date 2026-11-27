@@ -65,7 +65,7 @@ def optional(raw,key,parse):
         return None
 
 def tasks(sym):
-    d={f'f{t}':(FUT,'/fapi/v1/klines',dict(symbol=sym,interval=t,limit=180)) for t in ('1m','5m','15m','1h','4h')}
+    d={f'f{t}':(FUT,'/fapi/v1/klines',dict(symbol=sym,interval=t,limit=180)) for t in ('1m','5m','15m','1h','4h','1d')}
     d['s15m']=(SPOT,'/api/v3/klines',dict(symbol=sym,interval='15m',limit=96))
     for name,path,kwargs in [
         ('funding','/fapi/v1/premiumIndex',{}),('oi','/futures/data/openInterestHist',dict(period='15m',limit=9)),
@@ -142,6 +142,19 @@ def analog(sym,snapshot,side,stop,target,current_funding=None,current_oi=None):
                 oi_comparable=int(np.isfinite(historical_oi[chosen]).sum()) if current_oi is not None else 0,
                 method='1h trend, vol, volume, futures taker flow; supplemental funding/OI if available; 48h price paths')
 
+def daily_trend(raw,end):
+    day=frame(raw,end)
+    step=1440*MIN
+    if len(day)<50 or day.t.iloc[-1]!=end//step*step-step or not (day.t.diff().dropna()==step).all(): return None
+    return float(features(day).ema.iloc[-1])
+
+def market_direction(daily,four):
+    if daily is None: return '불확실'
+    if daily>.002 and four>.001: return '상승'
+    if daily<-.002 and four<-.001: return '하락'
+    if abs(daily)<=.002 and abs(four)<=.001: return '횡보'
+    return '불확실'
+
 def analyze(sym,raw,end,relative):
     bars={k:frame(raw[k],end) for k in ('f1m','f5m','f15m','f1h','f4h')}
     for key,b in bars.items():
@@ -153,11 +166,14 @@ def analyze(sym,raw,end,relative):
         if not math.isfinite(row['rsi']): row['rsi']=50.
         if not all(math.isfinite(value) for value in row.values()):
             raise ValueError('derived indicator is non-finite')
+    daily=optional(raw,'f1d',lambda x: daily_trend(x,end))
     a=f['f15m']; short=f['f5m']; fast=f['f1m']; hourly=f['f1h']; longer=f['f4h']
     price=float(bars['f1m'].c.iloc[-1])
     current=optional(raw,'ticker',lambda x:float(x['lastPrice']) if abs(end-int(x['closeTime']))<=180000 else None) or price
     atr=price*a['atr']
     lo,hi=structure(bars['f15m'].iloc[-90:])
+    hourly_low,hourly_high=structure(bars['f1h'].iloc[-48:])
+    lo+=hourly_low; hi+=hourly_high
     support=sorted(set(x for x in lo if x<price-.15*atr))
     resist=sorted(set(x for x in hi if x>price+.15*atr))
     lower=support[-1] if support else price-atr
@@ -254,7 +270,7 @@ def analyze(sym,raw,end,relative):
                               abs(tp/c['entry']-1) if tp else abs(c['stop']/c['entry']-1)*1.5,funding,oi_delta)
         c['historical_comparison']=historical_compare(c['historical'],c['net_target_return_notional'],c['stop_loss_notional'])
     best=max(decisions,key=lambda x:x['score'])
-    return dict(symbol=sym,price=current,completed_1m_close=price,last_open_ms=int(bars['f1m'].t.iloc[-1]),regime=regime,
+    return dict(symbol=sym,price=current,completed_1m_close=price,last_open_ms=int(bars['f1m'].t.iloc[-1]),regime=regime,market_direction=market_direction(daily,longer['ema']),
                 support=lower,resistance=upper,indicators=f,spot_flow=spot_flow,oi_change=oi_delta,funding=funding,
                 long_short=crowd_ratio,book_imbalance=imbalance,volume_profile_proxy_poc=profile_poc,
                 mark_price=optional(raw,'funding',lambda x:float(x['markPrice'])),
@@ -386,7 +402,7 @@ def fetch_candles_at(fetch, args, cutoff):
     data=fetch(host,path,**params)
     if path!='/fapi/v1/klines':
         return data
-    step=int(params['interval'][:-1])*({'m':MIN,'h':60*MIN}[params['interval'][-1]])
+    step=int(params['interval'][:-1])*({'m':MIN,'h':60*MIN,'d':1440*MIN}[params['interval'][-1]])
     expected=cutoff//step*step-step
     def complete(rows):
         return sorted({int(r[0]) for r in rows if len(r)>=10 and int(r[6])<cutoff})
