@@ -1,6 +1,6 @@
 {
-  "base": "18.3.1",
+  "base": "18.4.0",
   "bump": "minor",
   "channel": "production",
-  "notes": "V18.4: position-only exit adjustment notifications, daily/4h direction and less repetitive BTC/ETH alerts, existing-risk margin sizing rounded down to KRW 100,000, local position edits. Same-sample alert replay and limitations: ci/v18.4-validation.md. No database migration."
+  "notes": "V18.5: single-symbol manual requests, grouped manual context, cost-aware analog outcomes and detailed market data. Automated alerts, positions, paper logic and schema unchanged. See ci/v18.5-validation.md."
 }
