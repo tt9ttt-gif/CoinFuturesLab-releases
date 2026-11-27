@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 import autoupdate
-from message_format import RULE, timestamp, payload, reason, notice
+from message_format import RULE, timestamp, payload, payloads, reason, notice
 
 ROOT=Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'v17'))
@@ -84,7 +84,8 @@ def alert_settings():
     return get('alert_settings',dict(mode='important' if get('alerts',True) else 'off',paper=False,summary=False))
 
 def category(key):
-    if key.startswith('user/') or key.startswith('health/'): return 'important'
+    if key.startswith('user/'): return 'position_risk'
+    if key.startswith('health/'): return 'important'
     if key.startswith('paper/manage/'): return 'paper_manage'
     if key.startswith('paper/'): return 'paper'
     if key.startswith('summary/'): return 'summary'
@@ -93,7 +94,7 @@ def category(key):
 
 def permitted(kind):
     cfg=alert_settings()
-    return cfg['mode']!='off' and (kind=='important' or
+    return cfg['mode']!='off' and (kind in ('important','position_risk') or
         (kind=='market' and cfg['mode']=='all') or
         (kind in ('paper','paper_manage','summary') and cfg.get(kind,False)))
 
@@ -107,7 +108,7 @@ def notify(key,signature,text,detected=None,cooldown=0,force=False):
         actual=re.match(r'user/(\d+)/',key)
         if actual and not any(p['id']==int(actual[1]) for p in kv_get(c,'positions',[])): return
         row=c.execute('SELECT signature,queued FROM alerts WHERE key=?',(key,)).fetchone()
-        if row and (row[0]==signature or (not force and now-row[1]<cooldown)):
+        if row and (row[0]==signature or ((not force or (actual and row[0] in ('스탑 도달','청산 근접','추세·구조 동시 역행'))) and now-row[1]<cooldown)):
             return
         c.execute('INSERT OR REPLACE INTO alerts VALUES (?,?,?)',(key,signature,now))
         c.execute('INSERT INTO outbox(body,detected,analyzed,category) VALUES (?,?,?,?)',(text,detected or now,now,kind))
@@ -145,7 +146,7 @@ def sender(stop,token,chat):
     delay=2
     while not stop.wait(1):
         with db() as c:
-            row=c.execute('SELECT id,body,detected,analyzed,category FROM outbox WHERE sent IS NULL AND suppressed=0 ORDER BY id LIMIT 1').fetchone()
+            row=c.execute('SELECT id,body,detected,analyzed,category FROM outbox WHERE sent IS NULL AND suppressed=0 ORDER BY (category=?) DESC,id LIMIT 1',('position_risk',)).fetchone()
         if not row: continue
         ident,body,detected,analyzed,kind=row
         if kind=='legacy' or not permitted(kind) or (kind=='market' and time.time()-detected>120):
@@ -315,55 +316,172 @@ def position_liquidation(p):
     return p['entry']*(1-side*(1/lev-live.FEE))/(1-side*.005)
 
 
-def position_review(p,m,seed):
+def position_profit(p,price):
+    """P&L in the registered currency, with a constant currency conversion assumption."""
+    if not p.get('margin') or not p.get('leverage'):
+        return None
+    notional=p['margin']*p['leverage']
+    ratio=price/p['entry']
+    gross=notional*p['side']*(ratio-1)
+    estimated_entry=notional*live.FEE
+    exit_fee=notional*ratio*live.FEE
+    actual_entry=p.get('verified_entry_fee')
+    funding=p.get('verified_funding_pnl')
+    entry_fee=estimated_entry if actual_entry is None else actual_entry
+    net=gross-entry_fee-exit_fee+(funding if funding is not None else 0.)
+    # Slippage stress is computed at a separate adverse execution price.
+    stressed_ratio=ratio*(1-p['side']*live.SLIP)
+    stressed=notional*p['side']*(stressed_ratio-1)-entry_fee-notional*stressed_ratio*live.FEE+(funding if funding is not None else 0.)
+    return dict(notional=notional,gross=gross,entry=entry_fee,actual_entry=actual_entry,
+                exit=exit_fee,funding=funding,net=net,stress=stressed)
+
+
+def position_review(p,m,seed,mode='normal',stamp=None):
     side=p['side']
-    price=m.get('mark_price') or m['price']
+    mark=m.get('position_mark_price',m.get('mark_price'))
+    price=mark or m['price']
     c=next(x for x in m['directions'] if x['side']==side)
+    f=m.get('indicators',{})
+    a=f.get('f15m',{})
+    atr=c['atr_ratio']
+    direction=m.get('market_direction','불확실')
     structure=m.get('structure_break')==-side
-    opposite=m.get('market_direction')==('하락' if side==1 else '상승')
+    opposite=direction==('하락' if side==1 else '상승')
+    initial=p.get('initial_direction')
+    reversed_since_entry=initial==('상승' if side==1 else '하락') and opposite
     adverse=m['candidate']['side']!=side and m['candidate']['score']>=1.65
-    stop=p.get('stop')
+    flow=a.get('flow')
+    impulse=a.get('r6')
+    shock=impulse is not None and side*impulse<=-3*atr and a.get('volume',0)>=1.3
+    pressure=flow is not None and side*flow<=-.15 and adverse and (structure or opposite)
+    stop=p.get('stop'); target=p.get('target')
     hit=stop is not None and side*(price-stop)<=0
-    near=stop is not None and side*(price-stop)/price<=max(.002,c['atr_ratio'])
+    near=stop is not None and side*(price-stop)/price<=max(.002,atr)
     lev,margin=p.get('leverage'),p.get('margin')
-    pnl=margin*lev*(side*(price/p['entry']-1)-live.FEE*(1+price/p['entry'])) if lev and margin else None
+    profit=position_profit(p,price)
     liq=position_liquidation(p)
-    buffer=max(.005,min(.02,c['atr_ratio']*2)) if lev and lev>=25 else .005
+    buffer=max(.005,min(.02,atr*2)) if lev and lev>=25 else .005
     clearance=side*(price-liq)/price if liq is not None else None
     liquidation=clearance is not None and clearance<buffer
+    stop_clearance=side*(stop-liq)/price if stop is not None and liq is not None else None
+    unsafe_stop=stop_clearance is not None and stop_clearance<buffer
     proposal=position_adjustment(p,m,c) if adverse and (structure or opposite) else None
-    state=('스탑 도달' if hit else '청산 근접' if liquidation else '추세·구조 동시 역행' if structure and opposite
-           else '고배율·청산가 확인 필요' if lev and lev>=25 and liq is None
-           else '스탑 접근' if near else '구조·반대 근거 강화' if structure and adverse else '조정 검토' if proposal else '유지')
-    action=('전체 청산 검토' if state in ('스탑 도달','청산 근접','추세·구조 동시 역행')
-            else '위험 축소' if state in ('스탑 접근','고배율·청산가 확인 필요')
-            else '익절·손절 조정 검토' if proposal and proposal[0]!=stop else '일부 청산 검토' if state!='유지' else '유지')
+    if proposal and liq is not None and proposal[0] is not None and side*(proposal[0]-liq)/price<buffer:
+        proposal=(stop,proposal[1]) if proposal[1]!=target else None
+    state,action,risk='유지','유지 가능','보통'
+    if hit or liquidation or (structure and opposite):
+        state='스탑 도달' if hit else '청산 근접' if liquidation else '추세·구조 동시 역행'
+        action,risk='전체 청산 검토','매우 높음'
+    elif unsafe_stop or near or (stop is None and lev and lev>=25):
+        state='손절의 청산가 여유 부족' if unsafe_stop else '스탑 접근' if near else '고배율 손절 미등록'
+        action,risk='손절가 설정·조정 우선','높음'
+    elif (opposite and lev and lev>=20) or shock or pressure or reversed_since_entry:
+        state=('상위 추세 역행·고배율' if opposite and lev and lev>=20 else '불리한 거래량·변동성 확대' if shock
+               else '반대 체결 압력 확대' if pressure else '등록 시점 대비 상위 방향 반전')
+        action,risk='일부 익절 또는 위험 축소 검토','높음'
+    elif (opposite and adverse) or proposal:
+        state,action,risk='반대 근거 강화','유지하되 특정 가격 이탈 주의','높음'
+    elif stop is None:
+        action,risk='손절가 설정·조정 우선','미평가'
+    elif profit is None or liq is None or direction=='불확실':
+        action,risk='데이터 또는 정보 부족으로 판단 유보','미평가'
+    elif structure or adverse:
+        action,risk='유지하되 특정 가격 이탈 주의','주의'
+
     currency=p.get('currency','KRW')
     unit='원' if currency=='KRW' else ' '+currency
-    roe=pnl/margin if pnl is not None else None
-    seed_part=lambda amount: f' · 시드 대비 {amount/seed:+.2%}' if currency=='KRW' and amount is not None else ''
-    lines=[f"📌 등록 #{p['id']} {p['symbol']} · {action}",
-           f"⚠️ {state} · 상위 방향 {m.get('market_direction','불확실')} · 구조 {'역행' if structure else '이탈 미확인'}",
-           f"현재 {fmt(price)} / 등록가 {fmt(p['entry'])} · {'롱' if side==1 else '숏'}",
-           f"펀딩 제외 추정 손익 {fmt(pnl)}{unit}"+(f" · 증거금 수익률 {roe:+.2%}" if roe is not None else '')+seed_part(pnl),
-           f"지지 {fmt(m.get('support'))} / 저항 {fmt(m.get('resistance'))} · 익절 {fmt(p.get('target'))} / 손절 {fmt(stop)}",
-           f"레버리지 {fmt(lev,0)} / 증거금 {fmt(margin)}{unit} · 증거금 유형 "+{'cross':'교차','isolated':'격리'}.get(p.get('margin_type'),'미확인'),
-           f"격리 가정 청산가 {fmt(liq)}"+(f" · 가격 여유 {clearance:+.2%}" if clearance is not None else ' · 계좌 정보 필요'),
-           '등록값 기준 추정 · 거래소 체결 미확인']
-    for label,items in (('보유 근거',c.get('reasons',[])),('반대·무효화 근거',c.get('conflicts',[]))):
-        if items: lines.append(label+' · '+' / '.join(reason(k,m) for k,_ in items[:2]))
-    if c.get('invalidation'): lines.append('시장 판단 재평가 · '+c['invalidation'])
-    if p.get('initial_direction') is not None:
-        lines.append(f"등록 직후 상위 방향 {p['initial_direction']} → 현재 {m.get('market_direction','불확실')}")
-    if stop is not None and lev and margin:
-        risk=margin*lev*(max(0.,side*(p['entry']-stop)/p['entry'])+2*live.FEE+live.SLIP+abs(m.get('funding') or 0.))
-        lines.append(f"손절 계획 위험 {risk:,.2f}{unit}"+seed_part(risk))
+    money=lambda amount: '미확인' if amount is None else f'{amount:+,.2f}{unit}'
+    lower=m.get('support'); upper=m.get('resistance')
+    reason_text=state if state!='유지' else '손절 미등록' if stop is None else '상위 방향·구조와 등록 정보를 함께 확인'
+    trigger=stop if stop is not None else lower if side==1 else upper
+    lines=[f"📌 등록 #{p['id']} {m.get('symbol',p.get('symbol',''))} {'롱' if side==1 else '숏'} · {action}",
+           f"⚠️ 위험 {risk} · {reason_text} · 상위 방향 {direction} · 구조 {'역행' if structure else '이탈 미확인'}",
+           f"현재 {fmt(price)} ({'마크' if mark else '최근가'}) / 진입 {fmt(p['entry'])} USDT",
+           f"손절 {fmt(stop)} · 익절 {fmt(target)} · 보유 판단 재확인 {fmt(trigger)}",
+           f"격리 가정 청산가 {fmt(liq)}"+(f" · 현재 여유 {clearance:+.2%}" if clearance is not None else ' · 계좌 정보 필요')]
+    if profit:
+        lines.append(f"가격 미실현 {money(profit['gross'])} · 청산 가정 순손익 {money(profit['net'])} (미확인 펀딩 제외)")
+    else:
+        lines.append('가격 미실현·청산 가정 순손익 미확인 · 증거금/배수 필요')
+    for label,level in [('손절',stop),('익절',target)]:
+        if level is not None and mode!='simple':
+            lines.append(f"{label}까지 가격 변동 {level/price-1:+.2%} · 해당 가격 가정 순손익 "+money((position_profit(p,level) or {}).get('net')))
+    if mode!='simple':
+        lines.extend(['💰 손익 및 위험 근거',
+                      f"증거금 {fmt(margin)}{unit} · {fmt(lev,0)}배 · "+{'cross':'교차','isolated':'격리'}.get(p.get('margin_type'),'증거금 유형 미확인'),
+                      '등록값 기준 추정 · 거래소 체결·비용 미확인'])
+        if profit:
+            entry_label='확인된 진입 수수료' if profit['actual_entry'] is not None else '추정 진입 수수료'
+            lines.extend([f"{entry_label} {money(-profit['entry'])} · 추정 청산 수수료 {money(-profit['exit'])}",
+                          f"확인된 펀딩 {money(profit['funding'])} · 슬리피지 스트레스 순손익 {money(profit['stress'])}",
+                          f"증거금 수익률 가격 {profit['gross']/margin:+.2%} / 순손익 추정 {profit['net']/margin:+.2%} · 기초 가격 ±1%당 약 ±{lev:.2f}%p",
+                          (f"등록 시드 대비 추정 청산 손익 {profit['net']/seed:+.2%}" if currency=='KRW' and seed else '계좌 대비 손익률 미확인 · 동일 통화 계좌 정보 필요')])
+        if profit and profit['actual_entry'] is None: lines.append('실제 발생 진입 수수료 미확인 · 추정 수수료로 계산')
+        if stop is None:
+            lines.append('손절 미등록 · 손절 기준 계좌 위험 미확인')
+        elif profit and currency=='KRW' and seed:
+            stressed=position_profit(p,stop)['stress']
+            lines.append(f"손절 체결 가정 계좌 위험 {max(0.,-stressed)/seed:.2%} (갭 확대 미반영)")
+        if stop_clearance is not None:
+            lines.append(f"손절과 청산가 간 보호 여유 {stop_clearance:+.2%} · 모형 확인 기준 {buffer:.2%}")
+        if stop is not None and target is not None and profit:
+            stop_net=position_profit(p,stop)['stress']
+            target_net=position_profit(p,target)['net']
+            if stop_net<0 and target_net>0:
+                lines.append(f"등록 익절·손절의 비용 반영 손익비 {target_net/-stop_net:.2f}:1")
+        if near: lines.append('손절 거리가 최근 15분 변동폭 기준에 가까움. 단기 흔들림과 갭 위험을 확인하세요.')
+        slow=' / '.join(f"{label} EMA {f[key]['ema']:+.2%}" if f.get(key,{}).get('ema') is not None else f'{label} 미확인'
+                        for label,key in [('일봉','f1d'),('4시간','f4h'),('1시간','f1h')])
+        fast=' / '.join(f"{label} 6봉 {f[key]['r6']:+.2%}" if f.get(key,{}).get('r6') is not None else f'{label} 미확인'
+                        for label,key in [('15분','f15m'),('5분','f5m'),('1분','f1m')])
+        pct=lambda value: '미확인' if value is None else f'{value:+.2%}'
+        lines.extend(['📊 보유 판단 근거',slow,fast,
+                      f"15분 ATR {atr:.2%} · 거래량 배수 {fmt(a.get('volume'))} · 상태 {m.get('regime','미확인')}",
+                      f"현물 순수급 {pct(m.get('spot_flow'))} · 선물 순수급 {pct(flow)}",
+                      f"OI 변화 {pct(m.get('oi_change'))} · 펀딩 {pct(m.get('funding'))} · 롱/숏 비율 {fmt(m.get('long_short'))}"])
+        if m.get('oi_change') is not None and impulse is not None:
+            lines.append(f"15분 6봉 가격 {impulse:+.2%}과 공개 OI {m['oi_change']:+.2%} 동시 관측 · 개별 포지션 원인 미확인")
+        for label,items in (('보유 근거',c.get('reasons',[])),('반대 근거',c.get('conflicts',[]))):
+            if items: lines.append(label+' · '+' / '.join(reason(k,m) for k,_ in items[:2]))
+        if initial is not None: lines.append(f"등록 직후 상위 방향 {initial} → 현재 {direction}")
+        lines.append('🎯 가격대별 대응 (완료 15분봉 기준)')
+        for level,up in ((upper,True),(lower,False)):
+            if level is None: continue
+            favorable=up==(side==1)
+            confirmation=('상향 돌파 후 재지지·매수세 확인' if up else '하향 이탈 후 회복 실패·매도세 확인')
+            response=('보유를 검토하되 거래량 동반 여부와 다음 목표를 확인' if favorable else
+                      '위험 축소 검토. 이탈 지속 또는 손절 접근이면 전체 청산 검토')
+            invalidation='종가가 다시 기준선 안쪽으로 돌아오면 이 시나리오 재평가'
+            lines.append(f"{fmt(level)} {'저항' if up else '지지'} · {confirmation} · {response}")
+            lines.append(f"해당 가격 가정 순손익 {money((position_profit(p,level) or {}).get('net'))} · {invalidation}")
+        defended=lower if side==1 else upper
+        if defended is not None:
+            lines.append(f"{fmt(defended)} {'지지 유지·반등' if side==1 else '저항 유지·반락'} · 재시험 후 종가 방어와 수급 확인 시 유지 검토. 종가 이탈이 지속되면 방어 판단 무효.")
+        lines.append('지지·저항은 스윙이나 ATR 보완 기준입니다. 돌파 이후 종가가 되돌아오고 반대 체결 압력과 거래량이 동시에 커지면 재평가하세요.')
+    if stop is None and c.get('stop') and side*(price-c['stop'])>0:
+        candidate=c['stop']
+        if liq is None or side*(candidate-liq)/price>=buffer:
+            lines.append(f"손절 후보 {fmt(candidate)} USDT · 시장 구조·ATR 기준 · 미설정")
+        else:
+            lines.append('구조 기반 손절 후보의 청산 여유가 부족합니다. 배수·포지션 규모 축소 검토.')
+    if target is None and c.get('target') and side*(c['target']-price)>0:
+        lines.append(f"익절 후보 {fmt(c['target'])} USDT · 다음 구조 기준 · 미설정")
     if proposal:
         for name,label,new in zip(('stop','target'),('손절','익절'),proposal):
             old=p.get(name)
             if old is not None and new!=old:
-                delta=side*(new-old)/p['entry']*lev*margin if lev and margin else None
-                lines.append(f"{label} 조정 검토 {fmt(old)} → {fmt(new)} · 가격 기준 손익 변화 {fmt(delta)}{unit}")
+                before=position_profit(p,old)
+                after=position_profit(p,new)
+                delta=after['net']-before['net'] if before and after else None
+                lines.append(f"{label} 조정 검토 {fmt(old)} → {fmt(new)} · 추정 순손익 변화 {money(delta)} · 주문 변경 없음")
+    if mode=='detailed':
+        hist=c.get('historical',{})
+        indicators=m.get('manual_indicators',{})
+        lines.extend(['📚 상세 자료',f"완료 봉 기준 {timestamp(stamp or m.get('position_data_utc'))}",
+                      f"호가 불균형 {pct(m.get('book_imbalance'))} · 거래량 가격대 근사 POC {fmt(m.get('volume_profile_proxy_poc'))}",
+                      f"15분 집계 CVD 24봉 {fmt(m.get('position_cvd24',indicators.get('flow',{}).get('aggregated_CVD24')))} · 다이버전스 {m.get('position_cvd_divergence') or '미확인'}",
+                      f"가격 손익 = 증거금 × 배수 × 방향 × (평가가/진입가−1). 수수료 편도 {live.FEE:.3%}, 슬리피지 스트레스 {live.SLIP:.3%}.",
+                      f"엔진 유사 진입 관측 {hist.get('sample',0)}건 · 보유 포지션의 예측 확률로 해석 불가"])
     return state,'\n'.join(lines)
 
 
@@ -532,7 +650,7 @@ def trade_command(message,identity,prior,positions,seed):
                 if current is not None:
                     current.update(initial_direction=m.get('market_direction','불확실'),initial_analysis_utc=stamp)
                     kv_put(conn,'positions',active)
-        return reply+'\n\n'+(position_review(p,m,seed)[1] if m else '최신 데이터 부족으로 초기 대응 판단을 보류합니다.')
+        return reply+'\n\n'+(position_review(p,m,seed,get('format','normal'),stamp)[1] if m else '최신 데이터 부족으로 초기 대응 판단을 보류합니다.')
     except (OSError,ValueError,TimeoutError):
         return reply+'\n최신 데이터 조회에 실패했습니다. 등록 기록은 저장했습니다.'
 
@@ -842,7 +960,7 @@ def handle(message,identity='cmd'):
     if low.startswith('/close '): return position_edit(['/pos','close',low.split()[1]])
     if low.startswith('/levels '):
         return position_edit(['/pos','levels',low.split()[1],low])
-    position_query=low in ('/pos','/positions') or bool(re.search(r'보유\s*중|가지고 있어|포지션 (?:확인|분석|상태)',low))
+    position_query=low in ('/pos','/positions') or bool(re.search(r'보유\s*중|가지고 있어|내\s*포지션|포지션 (?:확인|분석|상태)',low))
     if position_query and requested_symbols(low):
         positions=[p for p in positions if p['symbol'] in requested_symbols(low)]
     symbols=tuple(dict.fromkeys(p['symbol'] for p in positions)) if position_query else query_symbols(message,context)
@@ -856,8 +974,10 @@ def handle(message,identity='cmd'):
         rows=[]
         for p in positions:
             m=markets.get(p['symbol'])
-            if not m: continue
-            rows.append(position_review(p,m,seed)[1])
+            if not m:
+                rows.append(f"등록 #{p['id']} {p['symbol']} · 최신 자료 부족으로 판단 유보")
+                continue
+            rows.append(position_review(p,m,seed,get('format','normal'),report['completed_through_utc'])[1])
         return '\n\n'.join(rows) or '등록 포지션이 없거나 최신 데이터가 비었습니다.'
     put('context/'+identity,context)
     if low.startswith('/simulate'):
@@ -939,14 +1059,15 @@ def manual_sender(stop,token,chat,outgoing):
         started=time.monotonic()
         metrics['send_queue_s']=round(started-queued,3)
         try:
-            try:
-                tg(token,'sendMessage',payload(chat,body))
-            except HTTPError as ex:
-                if ex.code!=429: raise
-                try: delay=max(1,int(ex.headers.get('Retry-After',1)))
-                except ValueError: delay=1
-                if delay>5 or stop.wait(delay): raise
-                tg(token,'sendMessage',payload(chat,body))
+            for part in payloads(chat,body):
+                try:
+                    tg(token,'sendMessage',part)
+                except HTTPError as ex:
+                    if ex.code!=429: raise
+                    try: delay=max(1,int(ex.headers.get('Retry-After',1)))
+                    except ValueError: delay=1
+                    if delay>5 or stop.wait(delay): raise
+                    tg(token,'sendMessage',part)
             metrics['delivered']=True
         except Exception as ex:
             metrics['delivered']=False
@@ -983,17 +1104,15 @@ def publish(report,detected):
         put(market_key,values)
         for p in get('positions',[]):
             if p['symbol']!=m['symbol']: continue
-            state,body=position_review(p,m,get('seed',3_000_000))
+            state,body=position_review(p,m,get('seed',3_000_000),'simple')
             key=f"user/{p['id']}/thesis"
             if state!='유지':
                 details=body.splitlines()
                 adjustments=[line for line in details if '조정 검토 ' in line]
-                notify(key,state,'\n'.join(line for line in details if line not in adjustments),detected,force=True)
+                notify(key,state,'\n'.join(line for line in details if line not in adjustments),detected,cooldown=1800,force=state in ('스탑 도달','청산 근접','추세·구조 동시 역행'))
                 if adjustments:
                     notify(f"user/{p['id']}/adjust",'|'.join(line.split(' · ',1)[0] for line in adjustments),
                            f"등록 #{p['id']} 가격 조정 검토 · {state}\n"+'\n'.join(adjustments),detected,cooldown=1800)
-            else:
-                with db() as conn: conn.execute('DELETE FROM alerts WHERE key=?',(key,))
         direction_key='last-alert-direction/'+m['symbol']
         last_direction=get(direction_key)
         for c in m['directions']:
