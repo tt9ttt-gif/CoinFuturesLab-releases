@@ -269,8 +269,11 @@ def analyze(sym,raw,end,relative):
         c['historical']=analog(sym,hourly,c['side'],abs(c['stop']/c['entry']-1),
                               abs(tp/c['entry']-1) if tp else abs(c['stop']/c['entry']-1)*1.5,funding,oi_delta)
         c['historical_comparison']=historical_compare(c['historical'],c['net_target_return_notional'],c['stop_loss_notional'])
+    recent=bars['f15m']
+    previous=recent.iloc[-13:-1]
+    breakout=1 if recent.c.iloc[-1]>previous.h.max()+.15*atr else -1 if recent.c.iloc[-1]<previous.l.min()-.15*atr else 0
     best=max(decisions,key=lambda x:x['score'])
-    return dict(symbol=sym,price=current,completed_1m_close=price,last_open_ms=int(bars['f1m'].t.iloc[-1]),regime=regime,market_direction=market_direction(daily,longer['ema']),
+    return dict(symbol=sym,price=current,completed_1m_close=price,last_open_ms=int(bars['f1m'].t.iloc[-1]),regime=regime,market_direction=market_direction(daily,longer['ema']),structure_break=breakout,
                 support=lower,resistance=upper,indicators=f,spot_flow=spot_flow,oi_change=oi_delta,funding=funding,
                 long_short=crowd_ratio,book_imbalance=imbalance,volume_profile_proxy_poc=profile_poc,
                 mark_price=optional(raw,'funding',lambda x:float(x['markPrice'])),
