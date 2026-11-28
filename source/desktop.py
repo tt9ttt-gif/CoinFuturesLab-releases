@@ -251,9 +251,10 @@ POSITION_CLOSE='POSITION_CLOSE'
 NUMBER=r'(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?'
 MONEY=re.compile(rf'(?<![\d.,+\-])(?P<value>{NUMBER})\s*(?P<unit>만\s*원|원|달러|usdt|usd|\$)(?![a-z])',re.I)
 CLOSE=re.compile(rf'(?:(?P<symbol>[^\s]+)\s+)?거래\s*종료(?:\s+(?P<result>수익|손실|손익)\s*(?P<amount>[+-]?{NUMBER}\s*(?:만\s*원|원|달러|usdt|usd|\$)))?',re.I)
-COMPLETED=re.compile(r'들어\s*왔|진입\s*(?:했|완료)|체결\s*(?:됐|되었|완료)')
-CHECK=re.compile(r'[?？]|어때|어떨|어떠|어땜|어떰|괜찮|분석|갈까|하면|하려|해도|할까|맞아|진입해도')
+COMPLETED=re.compile(r'들어\s*왔|진입\s*(?:했|완료)|체결\s*(?:됐|되었|완료)|(?:매수|매도)\s*완료')
+CHECK=re.compile(r'[?？]|어때|어떨|어떠|어땜|어떰|괜찮|분석|갈까|하면|했으면|됐으면|왔으면|하려|해도|할까|맞아')
 ENTRY_WORD=re.compile(r'지정가|예약|진입|들어갈까|롱|숏|\blong\b|\bshort\b')
+EXECUTION_CLOCK=re.compile(r'(?<![\d:])(?:(?P<day>\d{4}-\d{2}-\d{2})\s+)?(?P<hour>\d{1,2}):(?P<minute>\d{2})(?![\d:])')
 
 
 def trade_intent(message):
@@ -261,18 +262,27 @@ def trade_intent(message):
     if CLOSE.fullmatch(low): return POSITION_CLOSE
     if low.startswith('/register '): return POSITION_OPEN
     if low.startswith('/'): return None
-    entered=bool(COMPLETED.search(low))
-    uncertain=bool(CHECK.search(low) or re.search(r'아직|안\s*(?:했|들어)|못\s*(?:했|들어)|않았|오타|아니',low))
-    if entered and not uncertain and not re.search(r'예약|지정가',low):
+    uncertain=CHECK.search(low) or re.search(r'아직|안\s*(?:했|들어)|못\s*(?:했|들어)|않았|오타|아니|미체결|예정|희망',low)
+    entered=COMPLETED.search(low)
+    if entered and not uncertain: return POSITION_OPEN
+    if re.search(r'예약|미체결|예정|희망',low) or (ENTRY_WORD.search(low) and CHECK.search(low)): return ENTRY_ANALYSIS
+    if uncertain: return None
+    if re.search(r'(?:^|\s)진입(?:가)?\s',low) and re.search(r'롱|숏|\blong\b|\bshort\b',low):
         return POSITION_OPEN
-    if not entered and not uncertain and '진입가' in low and not re.search(r'예약|지정가|예정|희망',low):
-        if '증거금' in low and re.search(r'\d+\s*배',low) and re.search(r'롱|숏|\blong\b|\bshort\b',low):
-            return POSITION_OPEN
-        return 'confirm_open'
-    if ENTRY_WORD.search(low) and (CHECK.search(low) or re.search(r'예약|지정가',low)):
-        return ENTRY_ANALYSIS
-    if entered and not re.search(r'아직|안\s*(?:했|들어)|못\s*(?:했|들어)|않았|아니',low): return 'confirm_open'
+    if '진입가' in low or ('지정가' in low and re.search(NUMBER,low)): return 'confirm_open'
+    if '지정가' in low: return ENTRY_ANALYSIS
     return None
+
+
+def execution_time(value,received):
+    match=EXECUTION_CLOCK.fullmatch(value.strip())
+    if not match: raise ValueError('invalid execution clock')
+    local=received.astimezone(KST)
+    day=datetime.fromisoformat(match['day']) if match['day'] else local
+    reported=day.replace(hour=int(match['hour']),minute=int(match['minute']),second=0,microsecond=0,tzinfo=KST)
+    if reported>local or (not match['day'] and local-reported>timedelta(hours=12)):
+        raise ValueError('ambiguous execution date')
+    return reported.astimezone(timezone.utc).isoformat()
 
 
 def money_value(amount,unit):
@@ -282,7 +292,11 @@ def money_value(amount,unit):
 
 
 def trade_fields(message):
+    clock=EXECUTION_CLOCK.search(message)
+    if clock:
+        message=message[:clock.start()]+' '+message[clock.end():]
     fields=parse(message,{})
+    if clock: fields['execution_clock']=clock[0]
     fields.pop('margin',None)
     amounts=list(MONEY.finditer(message))
     if len(amounts)==1:
@@ -313,6 +327,7 @@ def position_liquidation(p):
     if not lev or p.get('margin_type')=='cross':
         return None
     side=p['side']
+    if p.get('position_notional') and p.get('margin'): lev=p['position_notional']/p['margin']
     return p['entry']*(1-side*(1/lev-live.FEE))/(1-side*.005)
 
 
@@ -320,7 +335,7 @@ def position_profit(p,price):
     """P&L in the registered currency, with a constant currency conversion assumption."""
     if not p.get('margin') or not p.get('leverage'):
         return None
-    notional=p['margin']*p['leverage']
+    notional=p.get('position_notional',p['margin']*p['leverage'])
     ratio=price/p['entry']
     gross=notional*p['side']*(ratio-1)
     estimated_entry=notional*live.FEE
@@ -396,7 +411,8 @@ def position_review(p,m,seed,mode='normal',stamp=None):
     trigger=stop if stop is not None else lower if side==1 else upper
     lines=[f"📌 등록 #{p['id']} {m.get('symbol',p.get('symbol',''))} {'롱' if side==1 else '숏'} · {action}",
            f"⚠️ 위험 {risk} · {reason_text} · 상위 방향 {direction} · 구조 {'역행' if structure else '이탈 미확인'}",
-           f"현재 {fmt(price)} ({'마크' if mark else '최근가'}) / 진입 {fmt(p['entry'])} USDT",
+           f"최근가 {fmt(m['price'])} · 마크 {fmt(mark)} · 신고 진입가 {fmt(p['entry'])} USDT",
+           f"등록 증거금 {fmt(margin)}{unit} · {fmt(lev,2)}배 · 진입 명목 {fmt(profit['notional'] if profit else None)}{unit}",
            f"손절 {fmt(stop)} · 익절 {fmt(target)} · 보유 판단 재확인 {fmt(trigger)}",
            f"격리 가정 청산가 {fmt(liq)}"+(f" · 현재 여유 {clearance:+.2%}" if clearance is not None else ' · 계좌 정보 필요')]
     if profit:
@@ -414,14 +430,13 @@ def position_review(p,m,seed,mode='normal',stamp=None):
             entry_label='확인된 진입 수수료' if profit['actual_entry'] is not None else '추정 진입 수수료'
             lines.extend([f"{entry_label} {money(-profit['entry'])} · 추정 청산 수수료 {money(-profit['exit'])}",
                           f"확인된 펀딩 {money(profit['funding'])} · 슬리피지 스트레스 순손익 {money(profit['stress'])}",
-                          f"증거금 수익률 가격 {profit['gross']/margin:+.2%} / 순손익 추정 {profit['net']/margin:+.2%} · 기초 가격 ±1%당 약 ±{lev:.2f}%p",
-                          (f"등록 시드 대비 추정 청산 손익 {profit['net']/seed:+.2%}" if currency=='KRW' and seed else '계좌 대비 손익률 미확인 · 동일 통화 계좌 정보 필요')])
+                          f"증거금 수익률 가격 {profit['gross']/margin:+.2%} / 순손익 추정 {profit['net']/margin:+.2%} · 진입가 기준 ±1% 변동당 약 ±{profit['notional']/margin:.2f}%p",
+                          '계좌 대비 손익률 미확인 · 실제 계좌 잔고 필요'])
         if profit and profit['actual_entry'] is None: lines.append('실제 발생 진입 수수료 미확인 · 추정 수수료로 계산')
         if stop is None:
             lines.append('손절 미등록 · 손절 기준 계좌 위험 미확인')
-        elif profit and currency=='KRW' and seed:
-            stressed=position_profit(p,stop)['stress']
-            lines.append(f"손절 체결 가정 계좌 위험 {max(0.,-stressed)/seed:.2%} (갭 확대 미반영)")
+        elif profit:
+            lines.append(f"손절 체결 가정 순손익 {money(position_profit(p,stop)['stress'])} (갭 확대 미반영)")
         if stop_clearance is not None:
             lines.append(f"손절과 청산가 간 보호 여유 {stop_clearance:+.2%} · 모형 확인 기준 {buffer:.2%}")
         if stop is not None and target is not None and profit:
@@ -480,9 +495,60 @@ def position_review(p,m,seed,mode='normal',stamp=None):
         lines.extend(['📚 상세 자료',f"완료 봉 기준 {timestamp(stamp or m.get('position_data_utc'))}",
                       f"호가 불균형 {pct(m.get('book_imbalance'))} · 거래량 가격대 근사 POC {fmt(m.get('volume_profile_proxy_poc'))}",
                       f"15분 집계 CVD 24봉 {fmt(m.get('position_cvd24',indicators.get('flow',{}).get('aggregated_CVD24')))} · 다이버전스 {m.get('position_cvd_divergence') or '미확인'}",
-                      f"가격 손익 = 증거금 × 배수 × 방향 × (평가가/진입가−1). 수수료 편도 {live.FEE:.3%}, 슬리피지 스트레스 {live.SLIP:.3%}.",
+                      f"가격 손익 = 진입 명목 × 방향 × (평가가/진입가−1). 수수료 편도 {live.FEE:.3%}, 슬리피지 스트레스 {live.SLIP:.3%}.",
                       f"엔진 유사 진입 관측 {hist.get('sample',0)}건 · 보유 포지션의 예측 확률로 해석 불가"])
     return state,'\n'.join(lines)
+
+
+def execution_path(p,stamp):
+    if p.get('execution_time_source')!='user_reported' or p.get('exposure_changed'):
+        return '진입 이후 경로 미확인 · 직접 입력한 체결 시각과 동일한 진입 기준이 필요합니다.'
+    minute=60_000
+    opened=int(datetime.fromisoformat(p['execution_time']).timestamp()*1000)
+    end=int(datetime.fromisoformat(stamp).timestamp()*1000)//minute*minute
+    first=(opened+minute-1)//minute*minute
+    start=max(first,end-720*minute)
+    if end<=start:
+        return '체결 이후 완료 1분봉 대기 중'
+    count=(end-start)//minute
+    rows=manual_rest(live.FUT,'/fapi/v1/klines',symbol=p['symbol'],interval='1m',
+                     startTime=start,endTime=end-1,limit=count)
+    if len(rows)!=count or any(int(row[0])!=start+i*minute or int(row[6])!=start+(i+1)*minute-1 for i,row in enumerate(rows)):
+        return '진입 이후 완료 1분봉에 누락이 있어 MFE·MAE 계산을 보류합니다.'
+    entry,side=p['entry'],p['side']
+    highs=[float(row[2]) for row in rows]
+    lows=[float(row[3]) for row in rows]
+    if not all(math.isfinite(value) and value>0 for value in highs+lows):
+        raise ValueError('invalid historical price')
+    moves=[side*(price/entry-1) for price in (max(highs),min(lows))]
+    label='최근 720개 봉만 · 부분 관측' if start>first else '체결 시각 이후'
+    result=f'{label} 공개 완료 1분봉 {count}개 · MFE {max(0,*moves):+.2%} · MAE {min(0,*moves):+.2%}'
+    if count>=10:
+        half=count//2
+        def buy_share(group):
+            volume=sum(float(row[5]) for row in group)
+            buys=sum(float(row[9]) for row in group)
+            return buys/volume if volume>0 and 0<=buys<=volume else None
+        before,after=buy_share(rows[:half]),buy_share(rows[half:])
+        if before is not None and after is not None:
+            result+=f'\n공개 선물 공격 매수 비중 전반 {before:.1%} → 후반 {after:.1%}'
+    return result
+
+
+def held_review(p,m,seed,stamp):
+    mode=get('format','normal')
+    _,body=position_review(p,m,seed,mode,stamp)
+    def local(value):
+        return datetime.fromisoformat(value).astimezone(KST).strftime('%m-%d %H:%M:%S KST') if value else '미확인'
+    reported=p.get('execution_time_source')=='user_reported'
+    label='사용자 신고 체결 시각' if reported else '수신 기준 임시 시각'
+    times=(f"{label} {local(p.get('execution_time'))}\n"
+           f"수신 {local(p.get('received_time'))} · 시장 조회 완료 {local(p.get('analysis_time'))}")
+    try:
+        path=execution_path(p,stamp)
+    except (OSError,ValueError,TypeError,IndexError,KeyError):
+        path='진입 이후 공개 분봉을 확인하지 못했습니다.'
+    return body+'\n\n'+times+'\n'+path
 
 
 def mutate_registration(fields,mode,ident=None):
@@ -501,6 +567,13 @@ def mutate_registration(fields,mode,ident=None):
         new_id=ident if mode=='edit' else max(used|{99999},key=lambda n:n or 0)+1
         previous_fields={k:v for k,v in (old or {}).items() if k not in fields and (old['side']==fields['side'] or k not in ('stop','target'))}
         p=dict(previous_fields,**fields,id=new_id)
+        if not old and p.get('received_time') and not p.get('execution_time'):
+            p.update(execution_time=p['received_time'],execution_time_source='receipt_proxy')
+        if p.get('execution_time')!= (old or {}).get('execution_time'):
+            p['analysis_time']=None
+        if old and ('amount' in fields or p.get('entry')!=old['entry'] or p['side']!=old['side']):
+            p.pop('position_notional',None)
+            p['exposure_changed']=True
         if 'amount' not in fields and p.get('amount_kind')=='notional' and p.get('leverage'):
             p['margin']=p['amount']/p['leverage']
         if not all(p.get(k) is None or math.isfinite(p[k]) and p[k]>0 for k in ('entry','leverage','margin','target','stop')):
@@ -528,6 +601,7 @@ def kv_put(conn,key,value):
 
 def trade_command(message,identity,prior,positions,seed):
     low=message.strip().lower()
+    received=datetime.fromtimestamp((getattr(REPLY_TIMING,'value',None) or {}).get('received_epoch',time.time()),timezone.utc)
     key='pending-trade/'+identity
     pending=get(key,{})
     if time.time()-pending.get('at',0)>600:
@@ -565,9 +639,13 @@ def trade_command(message,identity,prior,positions,seed):
         put(key,{})
         try: fields=trade_fields(message)
         except ValueError: return '금액 하나와 통화를 입력하세요.'
-    elif pending.get('stage')=='open' and low=='등록':
-        intent=POSITION_OPEN
+        fields['received_time']=received.isoformat()
+    elif pending.get('stage')=='open' and low in ('등록','체결','예약 분석'):
+        intent=ENTRY_ANALYSIS if low=='예약 분석' else POSITION_OPEN
         fields=pending['fields']
+    elif pending.get('stage')=='time' and EXECUTION_CLOCK.fullmatch(low):
+        intent=POSITION_OPEN
+        fields=dict(pending['fields'],execution_clock=low)
     elif pending.get('stage')=='amount' and low in ('증거금','총액','포지션 금액'):
         intent=pending['intent']
         fields=dict(pending['fields'],amount_kind='margin' if low=='증거금' else 'notional')
@@ -593,7 +671,7 @@ def trade_command(message,identity,prior,positions,seed):
         return '종목 하나와 양의 USDT 가격을 입력하세요.'
     if intent=='confirm_open':
         put(key,dict(stage='open',fields=fields,at=time.time()))
-        return '이미 체결된 포지션이면 등록을 입력하세요. 진입 검토라면 가격과 함께 예약 또는 괜찮아?를 입력하세요.'
+        return '이미 체결된 포지션이면 등록을 입력하세요. 진입 검토라면 예약 분석을 입력하세요.'
     if 'side' not in fields:
         prior_side=prior.get('side') if prior.get('symbol')==fields['symbol'] else None
         put(key,dict(intent=intent,stage='side',fields=fields,side=prior_side,at=time.time()))
@@ -623,6 +701,15 @@ def trade_command(message,identity,prior,positions,seed):
         if 'amount' in fields and 'margin' not in plan:
             result+='\n입력 금액에 대한 원화 위험 계산 자료가 부족합니다.'
         return '진입 전 분석 · 조회 전용\n'+result
+    if 'execution_clock' in fields:
+        try:
+            basis=datetime.fromisoformat(fields.get('received_time',received.isoformat()))
+            fields['execution_time']=execution_time(fields['execution_clock'],basis)
+        except ValueError:
+            put(key,dict(stage='time',fields=fields,at=time.time()))
+            return '체결 날짜·시각을 확인하세요. KST 기준 YYYY-MM-DD HH:MM으로 보내주세요.'
+        fields.pop('execution_clock')
+        fields['execution_time_source']='user_reported'
     if 'amount' in fields:
         if fields['amount_kind']=='notional':
             if 'leverage' not in fields:
@@ -642,15 +729,16 @@ def trade_command(message,identity,prior,positions,seed):
     reply=f"#{p['id']} 사용자 포지션 등록 완료"+(f" · 미입력 {missing}" if missing else '')
     try:
         m,stamp=manual_market(p['symbol'])
+        analysis_time=datetime.now(timezone.utc).isoformat()
         if m:
             with db() as conn:
                 conn.execute('BEGIN IMMEDIATE')
                 active=kv_get(conn,'positions',[])
                 current=next((row for row in active if row==p),None)
                 if current is not None:
-                    current.update(initial_direction=m.get('market_direction','불확실'),initial_analysis_utc=stamp)
+                    current.update(initial_direction=m.get('market_direction','불확실'),initial_analysis_utc=stamp,analysis_time=analysis_time)
                     kv_put(conn,'positions',active)
-        return reply+'\n\n'+(position_review(p,m,seed,get('format','normal'),stamp)[1] if m else '최신 데이터 부족으로 초기 대응 판단을 보류합니다.')
+        return reply+'\n\n'+(held_review(dict(p,analysis_time=analysis_time),m,seed,stamp) if m else '최신 데이터 부족으로 초기 대응 판단을 보류합니다.')
     except (OSError,ValueError,TimeoutError):
         return reply+'\n최신 데이터 조회에 실패했습니다. 등록 기록은 저장했습니다.'
 
@@ -666,14 +754,40 @@ def position_edit(parts,realized=None):
         p=next((x for x in active if x['id']==ident),None)
         if p is None: return '등록 번호를 확인하세요.'
         previous=dict(p)
-        if parts[1]=='add' and len(parts)==5:
-            price,margin=map(float,parts[3:])
-            if not all(math.isfinite(x) and x>0 for x in (price,margin)): return '가격·증거금은 양수여야 합니다.'
-            if p.get('currency','KRW')!='KRW': return '외화 추가 진입은 통화를 명시해 별도 포지션으로 등록하세요.'
-            if not p.get('margin'): return '기존 증거금이 없어 평균 진입가를 계산할 수 없습니다.'
-            p['entry']=(p['margin']+margin)/(p['margin']/p['entry']+margin/price)
-            p['margin']+=margin
-            p.update(amount=p['margin'],amount_kind='margin')
+        action=parts[1]
+        if action=='time' and len(parts)>=4:
+            try: corrected=execution_time(' '.join(parts[3:]),datetime.now(timezone.utc))
+            except ValueError: return 'KST 기준 과거 시각을 YYYY-MM-DD HH:MM으로 입력하세요.'
+            p.update(execution_time=corrected,execution_time_source='user_reported')
+        elif action in ('add','margin','leverage'):
+            leverage=p.get('leverage')
+            margin=p.get('margin')
+            notional=p.get('position_notional') or (margin*leverage if margin and leverage else None)
+            if notional is None or margin is None or leverage is None:
+                return '기존 증거금과 배수가 필요합니다. 먼저 등록 정보를 수정하세요.'
+            if action=='leverage' and len(parts)==4:
+                replacement=float(parts[3])
+                if not 1<=replacement<=125: return '배수는 1~125 범위로 입력하세요.'
+                p.update(leverage=replacement,position_notional=notional)
+            elif action in ('add','margin'):
+                start=4 if action=='add' else 3
+                raw=' '.join(parts[start:])
+                amount=MONEY.fullmatch(raw)
+                if amount:
+                    extra,currency=money_value(amount['value'],amount['unit'])
+                elif action=='add' and re.fullmatch(NUMBER,raw):
+                    extra,currency=float(raw.replace(',','')),'KRW'
+                else: return '금액과 통화를 입력하세요. 예: 500 USDT'
+                if currency!=p.get('currency','KRW'): return '등록 증거금과 같은 통화를 사용하세요.'
+                if not math.isfinite(extra) or extra<=0: return '금액은 양수여야 합니다.'
+                if action=='add':
+                    price=float(parts[3].replace(',',''))
+                    if not math.isfinite(price) or price<=0: return '가격은 양수여야 합니다.'
+                    increment=extra*leverage
+                    p.update(entry=(notional+increment)/(notional/p['entry']+increment/price),exposure_changed=True)
+                    notional+=increment
+                p.update(margin=margin+extra,amount=margin+extra,amount_kind='margin',position_notional=notional)
+            else: return '/pos leverage 번호 배수'
         elif parts[1]=='levels' and len(parts)==4:
             levels={k:v for k,v in parse(parts[3],{}).items() if k in ('target','stop')}
             if not levels or not all(math.isfinite(v) and v>0 for v in levels.values()): return '양의 익절가 또는 손절가를 입력하세요.'
@@ -683,10 +797,12 @@ def position_edit(parts,realized=None):
             if not 0<fraction<=1: return '청산 비율은 0 초과 100 이하입니다.'
             if p.get('margin') is not None: p['margin']*=1-fraction
             if p.get('amount') is not None: p['amount']*=1-fraction
+            if p.get('position_notional') is not None: p['position_notional']*=1-fraction
+            p['exposure_changed']=True
             if fraction==1:
                 active.remove(p)
                 conn.execute("UPDATE outbox SET suppressed=1 WHERE sent IS NULL AND instr(body,?)>0",(f'등록 #{ident} ',))
-        else: return '/pos add 번호 가격 증거금원 · /pos reduce 번호 비율 · /pos close 번호'
+        else: return '/pos add 번호 가격 금액 통화 · /pos margin 번호 금액 통화 · /pos leverage 번호 배수 · /pos time 번호 날짜 시각 · /pos reduce 번호 비율 · /pos close 번호'
         event=dict(at=time.time(),operation=parts[1],before=previous,after=dict(p))
         if realized is not None: event['realized_pnl']=realized
         history.append(event)
@@ -944,7 +1060,7 @@ def handle(message,identity='cmd'):
             put('format',args[1])
             return '메시지 상세도: '+args[1]
         return '/format simple | /format normal | /format detailed'
-    if low=='/help': return HELP+'\n등록: 이더 숏 진입가 1750 · 거래종료: 이더 거래종료 /pos close 번호 · 예약 분석: 이더 1700 롱 예약 · 상태: /pos'+'\n/pos add 번호 가격 증거금원 · /pos reduce 번호 비율 · /pos close 번호'
+    if low=='/help': return HELP+'\n등록: 이더 숏 진입가 1750 · 거래종료: 이더 거래종료 /pos close 번호 · 예약 분석: 이더 1700 롱 예약 · 상태: /pos'+'\n/pos add 번호 가격 금액 통화 · /pos margin 번호 금액 통화 · /pos leverage 번호 배수 · /pos time 번호 날짜 시각 · /pos reduce 번호 비율 · /pos close 번호'
     if low=='/status': return json.dumps(dict(get('status',{}),market_monitor='on',managed_positions=len(get('positions',[]))),ensure_ascii=False)
     if low=='/paper':
         accounts=latest().get('paper',{}).get('accounts',{})
@@ -971,13 +1087,14 @@ def handle(message,identity='cmd'):
         return '최신 완료 봉 시각을 검증하지 못해 분석을 보류합니다.'
     markets={m['symbol']:m for m in report['market']}
     if position_query:
+        analysis_time=datetime.now(timezone.utc).isoformat()
         rows=[]
         for p in positions:
             m=markets.get(p['symbol'])
             if not m:
                 rows.append(f"등록 #{p['id']} {p['symbol']} · 최신 자료 부족으로 판단 유보")
                 continue
-            rows.append(position_review(p,m,seed,get('format','normal'),report['completed_through_utc'])[1])
+            rows.append(held_review(dict(p,analysis_time=analysis_time),m,seed,report['completed_through_utc']))
         return '\n\n'.join(rows) or '등록 포지션이 없거나 최신 데이터가 비었습니다.'
     put('context/'+identity,context)
     if low.startswith('/simulate'):
@@ -1021,12 +1138,13 @@ def receive(stop,token,chat,manual):
         try:
             updates=tg(token,'getUpdates',dict(offset=offset,timeout=20,allowed_updates=['message']))
             received=time.monotonic()
+            received_epoch=time.time()
             for u in updates:
                 msg=u.get('message',{})
                 valid=(str(msg.get('chat',{}).get('id'))==str(chat) and msg.get('chat',{}).get('type')=='private'
                        and time.time()-msg.get('date',0)<=180 and msg.get('text'))
                 if valid:
-                    manual.put((msg['text'],dict(update=u['update_id'],received=received,
+                    manual.put((msg['text'],dict(update=u['update_id'],received=received,received_epoch=received_epoch,
                                                   poll_s=round(received-started,3),
                                                   telegram_age_s=round(time.time()-msg['date'],3))))
                 offset=u['update_id']+1
