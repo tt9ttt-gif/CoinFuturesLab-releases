@@ -351,6 +351,128 @@ def position_profit(p,price):
                 exit=exit_fee,funding=funding,net=net,stress=stressed)
 
 
+def protection_plan(p,m,price,atr,liq,buffer):
+    side=p['side']
+    gap=price*atr
+    if not math.isfinite(gap) or gap<=0:
+        return {'reason':'완료 15분봉 변동성 자료 없음'}
+    if liq is None:
+        return {'reason':'청산가 또는 안전 여유를 평가할 수 없음'}
+    if m.get('position_mark_price',m.get('mark_price')) is None:
+        return {'reason':'최신 마크가격 자료 없음. 최근가만으로 청산 여유를 산정하지 않음'}
+    if side*(price-liq)<price*buffer:
+        return {'reason':'현재 마크가격이 청산 위험 구간에 있음'}
+    levels=m.get('position_levels',{})
+    stop_key,target_key=('low','high') if side==1 else ('high','low')
+    rank=('f1h','f4h','f15m','f1w')
+    labels=dict(f1h='1시간',f4h='4시간',f15m='15분',f1w='주봉')
+    stops=[]
+    targets=[]
+    for key in rank:
+        for anchor in sorted(levels.get(key,{}).get(stop_key,[]),key=lambda value: side*(price-value)):
+            if side*(price-anchor)>=gap*.5:
+                level=round(anchor-side*gap*.35,2)
+                if side*(price-level)>=gap*.75:
+                    stops.append((level,f'{labels[key]} 스윙 {fmt(anchor)} 이탈에 15분 ATR 0.35배 완충'))
+        for anchor in levels.get(key,{}).get(target_key,[]):
+            if side*(anchor-price)>=gap:
+                level=round(anchor-side*gap*.15,2)
+                if side*(level-price)>=gap*.75:
+                    targets.append((level,f'{labels[key]} 스윙 {fmt(anchor)} 앞에 15분 ATR 0.15배 여유'))
+    registered=p.get('stop')
+    safe=[(level,why) for level,why in stops
+          if (registered is None or side*(level-registered)>=0)
+          and side*(level*(1-side*live.SLIP)-liq)>=price*buffer]
+    if not safe:
+        return {'reason':'변동성 완충·청산 여유·등록 손절 유지 조건을 함께 충족하는 구조 손절 없음'}
+    level,why=safe[0]
+    stop=position_profit(p,level)
+    current=position_profit(p,price)
+    if not stop or not current:
+        return {'reason':'등록 증거금 또는 배수가 없어 비용과 손실 평가 불가'}
+    risk=current['net']-stop['stress']
+    if risk<=0:
+        return {'reason':'현재가 대비 손절 위험 평가 불가'}
+    feasible=[]
+    for target,reason in sorted(set(targets),key=lambda row: (side*row[0],row[1])):
+        estimate=position_profit(p,target)['stress']
+        gain=estimate-current['net']
+        if estimate>0 and gain>=risk and (not feasible or side*(target-feasible[-1][0])>=gap):
+            feasible.append((target,reason,estimate,gain/risk))
+    return dict(stop=level,stop_reason=why,stop_net=stop['stress'],reward=feasible[:2],
+                room=side*(level*(1-side*live.SLIP)-liq)/price,atr=gap,
+                loss=max(0,-stop['stress'])/p['margin'],reason=None if feasible else '진입가·비용·현재 위험 대비 성립하는 구조 익절 없음')
+
+
+def holding_evidence(m,side):
+    f=m.get('indicators',{})
+    a=f.get('f15m',{})
+    h=a.get('r6')
+    flow=a.get('flow')
+    oi=m.get('position_oi')
+    funding=m.get('position_funding')
+    atr=a.get('atr')
+    volume=a.get('volume')
+    def impact(direction):
+        return '보유 방향에 유리' if direction==side else '보유 방향에 불리' if direction==-side else '보유 방향에 중립'
+    evidence=[]
+    if oi is not None:
+        directional=0
+        if oi>0 and h is not None and flow is not None and atr and abs(h)>=atr*.5 and abs(flow)>=.05 and h*flow>0:
+            directional=1 if h>0 else -1
+        observed=f'OI {oi:+.2%}'
+        if h is not None: observed+=f', 15분 6봉 가격 {h:+.2%}'
+        if flow is not None: observed+=f', 순공격 체결 비중 {flow:+.1%}'
+        if volume is not None: observed+=f', 거래량 {volume:.2f}배'
+        meaning=('포지션 잔량이 늘었고 가격과 공격 체결 방향이 일치합니다. 신규 포지션의 방향은 직접 확인할 수 없습니다.' if directional else
+                 '미결제약정은 열린 계약의 양입니다. 증감만으로 새 롱·숏의 방향을 판별할 수 없습니다.')
+        evidence.append((directional,f'{observed}. {meaning} {impact(directional)}. 다음 1시간봉이 주요 가격대를 유지하는지 확인하고 역행 이탈이면 축소를 검토합니다.'))
+    cvd=m.get('position_cvd24')
+    change=m.get('position_cvd_price_change')
+    if cvd is not None and change is not None:
+        direction=0 if cvd*change<=0 else 1 if cvd>0 else -1
+        meaning='공격 체결과 가격이 같은 방향입니다' if direction else '공격 체결에 가격이 따라가지 않아 반대 주문의 흡수 가능성이 있습니다'
+        evidence.append((direction,f'15분 24봉 누적 순공격 체결(CVD) {cvd:+,.2f} 기초자산, 가격 {change:+.2%}. {meaning}. {impact(direction)}. 돌파·이탈 뒤 종가와 거래량이 동행하는지 확인합니다.'))
+    rsi=a.get('rsi')
+    if rsi is not None:
+        meaning='과매도는 반등 가능성을 시사하나 하락 추세에서는 지속될 수 있습니다' if rsi<=30 else '과매수는 과열 신호이나 상승 추세에서는 지속될 수 있습니다' if rsi>=70 else '최근 상승·하락 강도가 극단 구간에 있지 않습니다'
+        evidence.append((0,f'15분 RSI {rsi:.1f}. {meaning}. 보유 방향 판단은 중립입니다. 종가의 구조 회복 여부를 먼저 확인합니다.'))
+    if funding is not None:
+        pays=funding*side>0
+        cost='지급 부담' if pays else '수취 가능' if funding else '비용 중립'
+        evidence.append((0,f'공개 펀딩률 {funding:+.4%}. 양수면 롱이 숏에 지급합니다. 현재 방향은 {cost}이며 가격 방향의 근거는 아닙니다. 다음 공시율과 비용을 재확인합니다.'))
+    return evidence
+
+
+def holding_trend(m,side):
+    f=m.get('indicators',{})
+    labels={'f1w':'주봉','f1d':'일봉','f4h':'4시간','f1h':'1시간'}
+    def trend(key):
+        ema=f.get(key,{}).get('ema')
+        return None if ema is None else 1 if ema>.002 else -1 if ema<-.002 else 0
+    words={1:'상승',-1:'하락',0:'보합',None:'미확인'}
+    values={k:trend(k) for k in labels}
+    primary=values['f4h']
+    daily=values['f1d']
+    relation='추세 추종' if daily==primary==side else '역추세 보유' if daily==primary==-side else '상위 추세 합의 미확인'
+    out=' · '.join(f'{labels[k]} {words[value]}' for k,value in values.items())+f' · {relation}'
+    moves=[(label,f.get(key,{}).get('r6')) for key,label in [('f15m','15분'),('f5m','5분'),('f1m','1분')]]
+    if primary and any(value is not None and value*primary<0 for _,value in moves):
+        out+='\n단기 역행이 관측됩니다. 1시간봉 구조까지 반전하는지 확인하기 전에는 4시간 추세 전환을 유보합니다.'
+    return out,values
+
+
+def protection_lines(plan,money):
+    if 'stop' not in plan:
+        return ['손절 후보·익절 후보 산정 보류 · '+plan['reason']+'. 위험 축소 검토.']
+    out=[f"손절 후보 {fmt(plan['stop'])} USDT · {plan['stop_reason']} · 미설정",
+         f"예상 순손익 {money(plan['stop_net'])} · 증거금 손실 {plan['loss']:.2%} · 청산 여유 {plan['room']:.2%}"]
+    for i,(target,reason,net,ratio) in enumerate(plan['reward'],1):
+        out.append(f"{i}차 익절 후보 {fmt(target)} USDT · {reason} · 미설정\n예상 순손익 {money(net)} · 현재가 기준 비용 반영 손익비 {ratio:.2f}:1")
+    if plan['reason']: out.append('익절 후보 산정 보류 · '+plan['reason']+'. 위험 축소 검토.')
+    return out
+
+
 def position_review(p,m,seed,mode='normal',stamp=None):
     side=p['side']
     mark=m.get('position_mark_price',m.get('mark_price'))
@@ -376,13 +498,18 @@ def position_review(p,m,seed,mode='normal',stamp=None):
     profit=position_profit(p,price)
     liq=position_liquidation(p)
     buffer=max(.005,min(.02,atr*2)) if lev and lev>=25 else .005
-    clearance=side*(price-liq)/price if liq is not None else None
+    clearance=side*(mark-liq)/mark if liq is not None and mark else None
     liquidation=clearance is not None and clearance<buffer
-    stop_clearance=side*(stop-liq)/price if stop is not None and liq is not None else None
+    stop_clearance=side*(stop-liq)/mark if stop is not None and liq is not None and mark else None
     unsafe_stop=stop_clearance is not None and stop_clearance<buffer
-    proposal=position_adjustment(p,m,c) if adverse and (structure or opposite) else None
-    if proposal and liq is not None and proposal[0] is not None and side*(proposal[0]-liq)/price<buffer:
-        proposal=(stop,proposal[1]) if proposal[1]!=target else None
+    plan=protection_plan(p,m,price,atr,liq,buffer)
+    proposal=None
+    if adverse and (structure or opposite) and 'stop' in plan:
+        proposed_stop=plan['stop'] if stop is not None and side*(plan['stop']-stop)>=price*max(.003,atr) else stop
+        proposed_target=target
+        if target is not None and plan['reward'] and side*(target-plan['reward'][0][0])>=price*max(.003,atr):
+            proposed_target=plan['reward'][0][0]
+        if (proposed_stop,proposed_target)!=(stop,target): proposal=(proposed_stop,proposed_target)
     state,action,risk='유지','유지 가능','보통'
     if hit or liquidation or (structure and opposite):
         state='스탑 도달' if hit else '청산 근접' if liquidation else '추세·구조 동시 역행'
@@ -414,11 +541,34 @@ def position_review(p,m,seed,mode='normal',stamp=None):
            f"최근가 {fmt(m['price'])} · 마크 {fmt(mark)} · 신고 진입가 {fmt(p['entry'])} USDT",
            f"등록 증거금 {fmt(margin)}{unit} · {fmt(lev,2)}배 · 진입 명목 {fmt(profit['notional'] if profit else None)}{unit}",
            f"손절 {fmt(stop)} · 익절 {fmt(target)} · 보유 판단 재확인 {fmt(trigger)}",
-           f"격리 가정 청산가 {fmt(liq)}"+(f" · 현재 여유 {clearance:+.2%}" if clearance is not None else ' · 계좌 정보 필요')]
+           f"격리 가정 청산가 {fmt(liq)}"+(f" · 현재 여유 {clearance:+.2%}" if clearance is not None else ' · 마크 또는 계좌 정보 미확인')]
     if profit:
         lines.append(f"가격 미실현 {money(profit['gross'])} · 청산 가정 순손익 {money(profit['net'])} (미확인 펀딩 제외)")
     else:
         lines.append('가격 미실현·청산 가정 순손익 미확인 · 증거금/배수 필요')
+    lines.extend(protection_lines(plan,money))
+    trend,trend_values=holding_trend(m,side)
+    evidence=holding_evidence(m,side)
+    prior=get(f"held-context/{p['id']}",{}) if stamp else {}
+    if mode=='simple':
+        lines.append(next((line for signal,line in evidence if signal==-side),evidence[0][1] if evidence else trend.splitlines()[0]))
+    elif mode!='simple':
+        lines.extend(['📊 시장 구조와 보유 방향',trend])
+        if prior.get('trend') and prior['trend']!=trend_values:
+            changed=[k for k in trend_values if prior['trend'].get(k)!=trend_values[k]]
+            lines.append('직전 자동 관측 대비 추세 변화 '+', '.join(k[1:] for k in changed))
+        prior_evidence=prior.get('evidence',{})
+        for label,line in ((line.split()[1] if line.startswith('15분 ') else line.split()[0],signal) for signal,line in evidence):
+            if label in prior_evidence and prior_evidence[label]!=line:
+                lines.append(f'직전 자동 관측 대비 {label}의 방향 근거가 달라졌습니다.')
+        if prior.get('direction') and prior['direction']!=direction:
+            lines.append(f"직전 자동 관측 상위 방향 {prior['direction']} → {direction}")
+        groups=(('핵심 보유 근거',side),('핵심 반대 근거',-side),('조건부 해석',0))
+        for heading,wanted in groups:
+            items=[line for signal,line in evidence if signal==wanted]
+            if items: lines.extend([heading,*items])
+        missing=[label for key,label in [('position_oi','OI'),('position_funding','펀딩'),('position_cvd24','CVD')] if m.get(key) is None]
+        if missing: lines.append('공개 데이터 미확인 · '+', '.join(missing))
     for label,level in [('손절',stop),('익절',target)]:
         if level is not None and mode!='simple':
             lines.append(f"{label}까지 가격 변동 {level/price-1:+.2%} · 해당 가격 가정 순손익 "+money((position_profit(p,level) or {}).get('net')))
@@ -453,9 +603,7 @@ def position_review(p,m,seed,mode='normal',stamp=None):
         lines.extend(['📊 보유 판단 근거',slow,fast,
                       f"15분 ATR {atr:.2%} · 거래량 배수 {fmt(a.get('volume'))} · 상태 {m.get('regime','미확인')}",
                       f"현물 순수급 {pct(m.get('spot_flow'))} · 선물 순수급 {pct(flow)}",
-                      f"OI 변화 {pct(m.get('oi_change'))} · 펀딩 {pct(m.get('funding'))} · 롱/숏 비율 {fmt(m.get('long_short'))}"])
-        if m.get('oi_change') is not None and impulse is not None:
-            lines.append(f"15분 6봉 가격 {impulse:+.2%}과 공개 OI {m['oi_change']:+.2%} 동시 관측 · 개별 포지션 원인 미확인")
+                      f"OI 변화 {pct(m.get('position_oi'))} · 펀딩 {pct(m.get('position_funding'))} · 롱/숏 비율 {fmt(m.get('long_short'))}"])
         for label,items in (('보유 근거',c.get('reasons',[])),('반대 근거',c.get('conflicts',[]))):
             if items: lines.append(label+' · '+' / '.join(reason(k,m) for k,_ in items[:2]))
         if initial is not None: lines.append(f"등록 직후 상위 방향 {initial} → 현재 {direction}")
@@ -467,20 +615,13 @@ def position_review(p,m,seed,mode='normal',stamp=None):
             response=('보유를 검토하되 거래량 동반 여부와 다음 목표를 확인' if favorable else
                       '위험 축소 검토. 이탈 지속 또는 손절 접근이면 전체 청산 검토')
             invalidation='종가가 다시 기준선 안쪽으로 돌아오면 이 시나리오 재평가'
-            lines.append(f"{fmt(level)} {'저항' if up else '지지'} · {confirmation} · {response}")
+            significance='매도 물량이 다시 출회될 수 있는 구간' if up else '매수가 가격을 방어할지 확인하는 구간'
+            lines.append(f"{fmt(level)} {'저항' if up else '지지'} · {significance} · {confirmation} · 보유에 {'유리' if favorable else '불리'} · {response}")
             lines.append(f"해당 가격 가정 순손익 {money((position_profit(p,level) or {}).get('net'))} · {invalidation}")
         defended=lower if side==1 else upper
         if defended is not None:
             lines.append(f"{fmt(defended)} {'지지 유지·반등' if side==1 else '저항 유지·반락'} · 재시험 후 종가 방어와 수급 확인 시 유지 검토. 종가 이탈이 지속되면 방어 판단 무효.")
         lines.append('지지·저항은 스윙이나 ATR 보완 기준입니다. 돌파 이후 종가가 되돌아오고 반대 체결 압력과 거래량이 동시에 커지면 재평가하세요.')
-    if stop is None and c.get('stop') and side*(price-c['stop'])>0:
-        candidate=c['stop']
-        if liq is None or side*(candidate-liq)/price>=buffer:
-            lines.append(f"손절 후보 {fmt(candidate)} USDT · 시장 구조·ATR 기준 · 미설정")
-        else:
-            lines.append('구조 기반 손절 후보의 청산 여유가 부족합니다. 배수·포지션 규모 축소 검토.')
-    if target is None and c.get('target') and side*(c['target']-price)>0:
-        lines.append(f"익절 후보 {fmt(c['target'])} USDT · 다음 구조 기준 · 미설정")
     if proposal:
         for name,label,new in zip(('stop','target'),('손절','익절'),proposal):
             old=p.get(name)
@@ -490,9 +631,19 @@ def position_review(p,m,seed,mode='normal',stamp=None):
                 delta=after['net']-before['net'] if before and after else None
                 lines.append(f"{label} 조정 검토 {fmt(old)} → {fmt(new)} · 추정 순손익 변화 {money(delta)} · 주문 변경 없음")
     if mode=='detailed':
+        for key,label in (('f1w','주봉'),('f1d','일봉'),('f4h','4시간'),('f1h','1시간'),('f15m','15분'),('f5m','5분'),('f1m','1분')):
+            row=f.get(key,{})
+            def indicator(name, perc=True):
+                value=row.get(name)
+                return '미확인' if value is None else f'{value:+.3%}' if perc else f'{value:.1f}'
+            lines.append(f"{label} EMA20/50 괴리 {indicator('ema')} · RSI {indicator('rsi',False)} · MACD 히스토그램/가격 {indicator('macd')}")
+        lines.append('MACD 히스토그램은 추세 모멘텀 변화의 보조 지표입니다. 가격 구조와 반대로 움직이면 추세 판단을 재확인합니다.')
+        lines.append('가격 계산: 손절은 확인된 스윙에서 15분 ATR의 0.35배 밖, 목표는 반대 스윙보다 0.15배 앞. 마크와 청산가 사이 여유 및 비용 반영 보상/위험을 검사합니다.')
+        if 'stop' in plan:
+            lines.append(f"15분 ATR {fmt(plan['atr'])} USDT · 최소 청산 여유 {buffer:.2%} · 목표 손익비 기준 1.00 이상. 추정 갭 추가 손실 미포함.")
         hist=c.get('historical',{})
         indicators=m.get('manual_indicators',{})
-        lines.extend(['📚 상세 자료',f"완료 봉 기준 {timestamp(stamp or m.get('position_data_utc'))}",
+        lines.extend(['📚 상세 자료',f"Binance USD-M 공개 완료 봉 기준 {timestamp(stamp or m.get('position_data_utc'))}",
                       f"호가 불균형 {pct(m.get('book_imbalance'))} · 거래량 가격대 근사 POC {fmt(m.get('volume_profile_proxy_poc'))}",
                       f"15분 집계 CVD 24봉 {fmt(m.get('position_cvd24',indicators.get('flow',{}).get('aggregated_CVD24')))} · 다이버전스 {m.get('position_cvd_divergence') or '미확인'}",
                       f"가격 손익 = 진입 명목 × 방향 × (평가가/진입가−1). 수수료 편도 {live.FEE:.3%}, 슬리피지 스트레스 {live.SLIP:.3%}.",
@@ -1222,7 +1373,14 @@ def publish(report,detected):
         put(market_key,values)
         for p in get('positions',[]):
             if p['symbol']!=m['symbol']: continue
-            state,body=position_review(p,m,get('seed',3_000_000),'simple')
+            observed=f"held-context/{p['id']}"
+            previous_held=get(observed,{})
+            if previous_held.get('stamp')==stamp and stamp:
+                continue
+            state,body=position_review(p,m,get('seed',3_000_000),'simple',stamp)
+            _,trend_values=holding_trend(m,p['side'])
+            evidence={line.split()[1] if line.startswith('15분 ') else line.split()[0]:signal for signal,line in holding_evidence(m,p['side'])}
+            put(observed,dict(stamp=stamp,trend=trend_values,direction=m.get('market_direction'),evidence=evidence))
             key=f"user/{p['id']}/thesis"
             if state!='유지':
                 details=body.splitlines()
