@@ -34,7 +34,7 @@ class ReleaseChecks(unittest.TestCase):
             assert sum(k.startswith('idea/') for k,_ in notes)==1
             assert not any(k.startswith('user/') for k,_ in notes)
             state['positions']=[dict(id=7,symbol='BTCUSDT',side=1,entry=99,margin=100000,leverage=10,stop=97,target=112)]
-            m['directions'][0]['stop']=98
+            m.update(mark_price=100.,position_levels={'f1h':{'low':[98.035],'high':[108.]}})
             app.publish(report,120)
             assert any(k=='user/7/thesis' for k,_ in notes)
             assert any(k=='user/7/adjust' and '97.00 → 98.00' in v for k,v in notes)

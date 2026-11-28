@@ -1,6 +1,6 @@
 {
-  "base": "18.8.0",
-  "version": "18.10.0",
+  "base": "18.10.0",
+  "bump": "minor",
   "channel": "production",
-  "notes": "V18.10: separate reported fills from limit-entry analysis, record KST execution and receipt times independently, preserve user-provided collateral and track public post-entry price excursions."
+  "notes": "V18.11: held-position evidence with weekly-through-minute context, cost and liquidation checked structural exits, and position-only monitoring."
 }
