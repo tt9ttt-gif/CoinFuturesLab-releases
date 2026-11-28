@@ -65,7 +65,7 @@ def optional(raw,key,parse):
         return None
 
 def tasks(sym):
-    d={f'f{t}':(FUT,'/fapi/v1/klines',dict(symbol=sym,interval=t,limit=180)) for t in ('1m','5m','15m','1h','4h','1d')}
+    d={f'f{t}':(FUT,'/fapi/v1/klines',dict(symbol=sym,interval=t,limit=180)) for t in ('1m','5m','15m','1h','4h','1d','1w')}
     d['s15m']=(SPOT,'/api/v3/klines',dict(symbol=sym,interval='15m',limit=96))
     for name,path,kwargs in [
         ('funding','/fapi/v1/premiumIndex',{}),('oi','/futures/data/openInterestHist',dict(period='15m',limit=9)),
@@ -309,9 +309,29 @@ def analyze(sym,raw,end,relative):
     change=float(recent.c.iloc[-1]/recent.c.iloc[-25]-1)
     divergence=('상승 가격·순매도' if change>0 and cvd<0 else
                 '하락 가격·순매수' if change<0 and cvd>0 else '방향 불일치 미관측')
-    return dict(symbol=sym,price=current,completed_1m_close=price,last_open_ms=int(bars['f1m'].t.iloc[-1]),regime=regime,market_direction=market_direction(daily,longer['ema']),structure_break=breakout,
+    week_ms=7*1440*MIN
+    monday=4*1440*MIN
+    def closed_week(rows):
+        week=frame(rows,end)
+        last=(end-monday)//week_ms*week_ms+monday-week_ms
+        if len(week)<50 or week.t.iloc[-1]!=last or not (week.t.diff().dropna()==week_ms).all():
+            return None
+        return week
+    week=optional(raw,'f1w',closed_week)
+    levels={}
+    for key,series in [('f15m',bars['f15m']),('f1h',bars['f1h']),('f4h',bars['f4h']),('f1w',week)]:
+        if series is None: continue
+        swing_low,swing_high=structure(series.iloc[-48:])
+        levels[key]={'low':swing_low,'high':swing_high}
+    if week is not None:
+        f['f1w']={'ema':float(features(week).ema.iloc[-1])}
+    mark=optional(raw,'funding',lambda x:float(x['markPrice']) if abs(int(x['time'])-end)<=180000 else None)
+    position_oi=optional(raw,'oi',lambda x:oi_delta if 0<=end-int(x[-1]['timestamp'])<=30*MIN else None)
+    position_funding=optional(raw,'funding',lambda x:funding if abs(int(x['time'])-end)<=180000 else None)
+    return dict(position_levels=levels,position_oi=position_oi,position_funding=position_funding,
+                position_cvd_price_change=change,symbol=sym,price=current,completed_1m_close=price,last_open_ms=int(bars['f1m'].t.iloc[-1]),regime=regime,market_direction=market_direction(daily,longer['ema']),structure_break=breakout,
                 position_cvd24=cvd,position_cvd_divergence=divergence,
-                position_mark_price=optional(raw,'funding',lambda x:float(x['markPrice']) if abs(int(x['time'])-end)<=180000 else None),
+                position_mark_price=mark,
                 support=lower,resistance=upper,indicators=f,spot_flow=spot_flow,oi_change=oi_delta,funding=funding,
                 long_short=crowd_ratio,book_imbalance=imbalance,volume_profile_proxy_poc=profile_poc,
                 mark_price=optional(raw,'funding',lambda x:float(x['markPrice'])),
@@ -443,6 +463,7 @@ def fetch_candles_at(fetch, args, cutoff):
     data=fetch(host,path,**params)
     if path!='/fapi/v1/klines':
         return data
+    if params['interval']=='1w': return data
     step=int(params['interval'][:-1])*({'m':MIN,'h':60*MIN,'d':1440*MIN}[params['interval'][-1]])
     expected=cutoff//step*step-step
     def complete(rows):
