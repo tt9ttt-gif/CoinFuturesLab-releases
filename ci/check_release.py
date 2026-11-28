@@ -22,6 +22,11 @@ def gh(*args):
 
 def version_for(plan):
     base = updater.version(plan["base"])
+    if "version" in plan:
+        requested = updater.version(plan["version"])
+        if plan["version"] != ".".join(map(str, requested)) or requested <= base:
+            raise ValueError("explicit release version must be canonical and newer than the base")
+        return plan["version"]
     index = {"major":0, "minor":1, "patch":2}[plan["bump"]]
     return ".".join(str(x+1 if i==index else 0 if i>index else x) for i,x in enumerate(base))
 
