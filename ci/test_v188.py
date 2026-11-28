@@ -17,7 +17,7 @@ def market(direction='하락',price=1674.53):
     long=dict(side=1,score=.2,atr_ratio=.003,stop=1660,target=1690)
     short=dict(long,side=-1,score=2,stop=1690,target=1660)
     return dict(symbol='ETHUSDT',price=price,mark_price=price,market_direction=direction,
-                support=1665,resistance=1686,directions=[long,short],candidate=short,
+                support=1665,resistance=1686,position_levels={'f1h':{'low':[1665,1650],'high':[1686,1710]}},directions=[long,short],candidate=short,
                 indicators={'f15m':dict(flow=-.1,r6=-.002,volume=1.2),'f1d':{'ema':-.01}},position_cvd24=-120)
 
 
