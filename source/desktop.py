@@ -473,7 +473,7 @@ def protection_lines(plan,money):
     return out
 
 
-def position_review(p,m,seed,mode='normal',stamp=None):
+def position_review(p,m,seed,mode='normal',stamp=None,*,prior=None,plan=None):
     side=p['side']
     mark=m.get('position_mark_price',m.get('mark_price'))
     price=mark or m['price']
@@ -502,7 +502,8 @@ def position_review(p,m,seed,mode='normal',stamp=None):
     liquidation=clearance is not None and clearance<buffer
     stop_clearance=side*(stop-liq)/mark if stop is not None and liq is not None and mark else None
     unsafe_stop=stop_clearance is not None and stop_clearance<buffer
-    plan=protection_plan(p,m,price,atr,liq,buffer)
+    if plan is None:
+        plan=protection_plan(p,m,price,atr,liq,buffer)
     proposal=None
     if adverse and (structure or opposite) and 'stop' in plan:
         proposed_stop=plan['stop'] if stop is not None and side*(plan['stop']-stop)>=price*max(.003,atr) else stop
@@ -549,7 +550,9 @@ def position_review(p,m,seed,mode='normal',stamp=None):
     lines.extend(protection_lines(plan,money))
     trend,trend_values=holding_trend(m,side)
     evidence=holding_evidence(m,side)
-    prior=get(f"held-context/{p['id']}",{}) if stamp else {}
+    if prior is None:
+        prior=get(f"held-context/{p['id']}",{}) if stamp else {}
+        prior=prior.get('previous',prior) if prior.get('stamp')==stamp else prior
     if mode=='simple':
         lines.append(next((line for signal,line in evidence if signal==-side),evidence[0][1] if evidence else trend.splitlines()[0]))
     elif mode!='simple':
@@ -1377,10 +1380,14 @@ def publish(report,detected):
             previous_held=get(observed,{})
             if previous_held.get('stamp')==stamp and stamp:
                 continue
-            state,body=position_review(p,m,get('seed',3_000_000),'simple',stamp)
             _,trend_values=holding_trend(m,p['side'])
-            evidence={line.split()[1] if line.startswith('15분 ') else line.split()[0]:signal for signal,line in holding_evidence(m,p['side'])}
-            put(observed,dict(stamp=stamp,trend=trend_values,direction=m.get('market_direction'),evidence=evidence))
+            evidence={line.split()[1] if line.startswith('15분 ') else line.split()[0]:signal
+                      for signal,line in holding_evidence(m,p['side'])}
+            mark=m.get('position_mark_price',m.get('mark_price'))
+            atr=next(row['atr_ratio'] for row in m['directions'] if row['side']==p['side'])
+            buffer=max(.005,min(.02,atr*2)) if p.get('leverage',0) and p['leverage']>=25 else .005
+            plan=protection_plan(p,m,mark or m['price'],atr,position_liquidation(p),buffer)
+            state,body=position_review(p,m,0,'simple',stamp,prior=previous_held,plan=plan)
             key=f"user/{p['id']}/thesis"
             if state!='유지':
                 details=body.splitlines()
@@ -1389,6 +1396,20 @@ def publish(report,detected):
                 if adjustments:
                     notify(f"user/{p['id']}/adjust",'|'.join(line.split(' · ',1)[0] for line in adjustments),
                            f"등록 #{p['id']} 가격 조정 검토 · {state}\n"+'\n'.join(adjustments),detected,cooldown=1800)
+            prior_stop=previous_held.get('stop')
+            current_stop=plan.get('stop')
+            changed_structure=(m.get('structure_break') in (-1,1) or
+                               bool(previous_held.get('trend') and previous_held['trend']!=trend_values))
+            if (changed_structure and prior_stop is not None and current_stop is not None
+                    and p['side']*(current_stop-prior_stop)>=m['price']*max(.003,atr)):
+                notify(f"user/{p['id']}/plan",str(current_stop),
+                       f"등록 #{p['id']} 구조 손절 후보 {fmt(prior_stop)} → {fmt(current_stop)} USDT\n"
+                       f"{plan['stop_reason']} · 이전 후보 대비 위험 축소 방향 · 미설정",detected,cooldown=1800)
+            summary=dict(stamp=stamp,trend=trend_values,direction=m.get('market_direction'),evidence=evidence,stop=current_stop)
+            prior_summary={k:v for k,v in previous_held.items() if k!='previous'}
+            if prior_summary:
+                summary['previous']=prior_summary
+            put(observed,summary)
         direction_key='last-alert-direction/'+m['symbol']
         last_direction=get(direction_key)
         for c in m['directions']:
