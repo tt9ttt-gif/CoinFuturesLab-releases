@@ -1,6 +1,6 @@
 {
-  "base": "18.7.0",
-  "bump": "minor",
+  "base": "18.8.0",
+  "version": "18.10.0",
   "channel": "production",
-  "notes": "V18.8: deeper held-position risk analysis, transparent P&L components, two-sided price scenarios and safe Telegram message splitting."
+  "notes": "V18.10: separate reported fills from limit-entry analysis, record KST execution and receipt times independently, preserve user-provided collateral and track public post-entry price excursions."
 }
