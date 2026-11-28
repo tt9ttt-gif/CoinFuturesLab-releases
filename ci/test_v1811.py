@@ -1,6 +1,7 @@
 import os
 import time
 import unittest
+from unittest.mock import patch
 from test_v188 import app, market, position
 
 
@@ -51,6 +52,31 @@ class HeldEngine(unittest.TestCase):
             self.assertLess(plan['stop'],price)
         else:
             self.assertTrue(plan['reason'])
+
+    def test_adjustment_requires_a_registered_position_and_new_structure(self):
+        m=market(price=100)
+        m['directions'][0]['atr_ratio']=.01
+        m['position_levels']={'f1h':{'low':[97],'high':[112]}}
+        p=position(entry=100,leverage=5)
+        notes=[]
+        state={'positions':[p]}
+        def send(key,signature,body,*args,**kwargs):
+            notes.append((key,body))
+        def publish(minute):
+            return app.publish(dict(market=[m],completed_through_utc=f'2026-11-28T12:{minute}:00+00:00'),0)
+        m['directions']=[dict(row,entry_status='wait',candidate_visible=False) for row in m['directions']]
+        with patch.object(app,'get',state.get),patch.object(app,'put',state.__setitem__),patch.object(app,'notify',send),patch.object(app,'health'),patch.object(app,'signal_context',return_value=(False,set())):
+            publish('00')
+            m['position_levels']['f1h']['low']=[98]
+            m['structure_break']=1
+            publish('00')
+            self.assertFalse(any(k.endswith('/plan') for k,_ in notes))
+            publish('01')
+            self.assertEqual(sum(k.endswith('/plan') for k,_ in notes),1)
+            state['positions']=[]
+            m['position_levels']['f1h']['low']=[99]
+            publish('02')
+            self.assertEqual(sum(k.endswith('/plan') for k,_ in notes),1)
 
     def test_trend_context_and_missing_week(self):
         m=market()
